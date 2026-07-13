@@ -130,7 +130,6 @@ const approvedCiActionPins = new Set([
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271",
   "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
-  "rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432",
 ]);
 const ciActionReferences = [...ciWorkflow.matchAll(/^\s*uses:\s*([^\s#]+)/gm)].map(
   (match) => match[1],
@@ -147,6 +146,10 @@ const rustJob = rustJobMarker === -1 ? "" : ciWorkflow.slice(rustJobMarker);
 const rustClippyMarker = rustJob.indexOf("      - name: Run Clippy");
 const lockedFrontendInstallMarker = rustJob.indexOf("pnpm install --frozen-lockfile");
 const frontendBuildMarker = rustJob.indexOf("pnpm build");
+const cargoAuditInstallMarker = rustJob.indexOf(
+  "cargo install cargo-audit --version 0.22.2 --locked",
+);
+const cargoAuditRunMarker = rustJob.indexOf("cargo audit --file src-tauri/Cargo.lock");
 assert(
   rustClippyMarker > 0 &&
     lockedFrontendInstallMarker > 0 &&
@@ -154,6 +157,12 @@ assert(
     frontendBuildMarker > lockedFrontendInstallMarker &&
     frontendBuildMarker < rustClippyMarker,
   "Rust CI must build locked frontend assets before Tauri macros run under Clippy.",
+);
+assert(
+  cargoAuditInstallMarker > 0 &&
+    cargoAuditRunMarker > cargoAuditInstallMarker &&
+    !rustJob.includes("rustsec/audit-check@"),
+  "Rust CI must run the reviewed locked cargo-audit version without a token-bearing action.",
 );
 
 const permissions = Array.isArray(capability.permissions) ? capability.permissions : [];

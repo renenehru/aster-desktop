@@ -15,7 +15,7 @@ All notable project changes are recorded in this file. The format follows [Keep 
 
 ### Security
 
-- CI actions now require reviewed full-SHA pins with hosted-runner-supported runtimes. The temporary `rustsec/audit-check` pin uses the official verified upstream Node 24 transition commit because no Node 24 release exists yet; it must return to a released revision when one is available.
+- CI actions now require reviewed full-SHA pins with hosted-runner-supported runtimes. Rust dependency auditing installs the reviewed `cargo-audit` 0.22.2 release with upstream lock metadata and does not grant a third-party action a GitHub token or write permission.
 - Source handoff archives now require a clean identified Git commit and tracked-file-only `git archive` generation, preventing ignored or untracked workspace data from entering a release through an incomplete denylist.
 - Removed the unsupported `RUST_LOG` environment example and added a configuration regression assertion so secrets, endpoints, certificate overrides, and diagnostic settings are not advertised through environment files.
 

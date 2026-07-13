@@ -96,10 +96,10 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml --workspace --all-targets --all-features --locked
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --all-targets --all-features --locked
+      - name: Install pinned Rust dependency auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # Node 24 transition commit; no Node 24 release exists yet
-        with:
-          working-directory: src-tauri
+        run: cargo audit --file src-tauri/Cargo.lock
       - name: Enforce Rust license policy
         run: node scripts/rust-license-policy.mjs
       - name: Generate CycloneDX SBOM
