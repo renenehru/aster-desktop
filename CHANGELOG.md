@@ -10,10 +10,12 @@ All notable project changes are recorded in this file. The format follows [Keep 
 
 ### Changed
 
+- Rust CI now installs the locked frontend dependencies and builds the production web assets before invoking Tauri macros, so clean runners do not depend on an untracked local `dist/` directory.
 - Repository publication and collaboration guidance now distinguishes source publication from unsigned engineering artifacts.
 
 ### Security
 
+- CI actions now require reviewed full-SHA pins with hosted-runner-supported runtimes. The temporary `rustsec/audit-check` pin uses the official verified upstream Node 24 transition commit because no Node 24 release exists yet; it must return to a released revision when one is available.
 - Source handoff archives now require a clean identified Git commit and tracked-file-only `git archive` generation, preventing ignored or untracked workspace data from entering a release through an incomplete denylist.
 - Removed the unsupported `RUST_LOG` environment example and added a configuration regression assertion so secrets, endpoints, certificate overrides, and diagnostic settings are not advertised through environment files.
 

@@ -53,6 +53,7 @@ const packageRaw = await read("package.json");
 const packageManifest = JSON.parse(packageRaw);
 const environmentExample = await read(".env.example");
 const packageEngineering = await read("scripts/package-engineering.ps1");
+const ciWorkflow = await read(".github/workflows/ci.yml");
 const mainCargo = await read("src-tauri/Cargo.toml");
 const helperCargo = await read("src-tauri/credential-prompt/Cargo.toml");
 const frontendFiles = await matchingFiles(
@@ -121,6 +122,38 @@ assert(
 assert(
   !/^\s*[A-Z][A-Z0-9_]*\s*=/m.test(environmentExample),
   "The environment example must not advertise unsupported secret, endpoint, or diagnostic configuration.",
+);
+
+const approvedCiActionPins = new Set([
+  "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+  "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+  "pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271",
+  "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
+  "rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432",
+]);
+const ciActionReferences = [...ciWorkflow.matchAll(/^\s*uses:\s*([^\s#]+)/gm)].map(
+  (match) => match[1],
+);
+const uniqueCiActionReferences = new Set(ciActionReferences);
+assert(
+  ciActionReferences.length > 0 &&
+    ciActionReferences.every((reference) => approvedCiActionPins.has(reference)) &&
+    [...approvedCiActionPins].every((reference) => uniqueCiActionReferences.has(reference)),
+  "CI actions must use the reviewed full-SHA pins whose upstream runtimes were approved for the hosted runner.",
+);
+const rustJobMarker = ciWorkflow.indexOf("\n  rust:\n");
+const rustJob = rustJobMarker === -1 ? "" : ciWorkflow.slice(rustJobMarker);
+const rustClippyMarker = rustJob.indexOf("      - name: Run Clippy");
+const lockedFrontendInstallMarker = rustJob.indexOf("pnpm install --frozen-lockfile");
+const frontendBuildMarker = rustJob.indexOf("pnpm build");
+assert(
+  rustClippyMarker > 0 &&
+    lockedFrontendInstallMarker > 0 &&
+    lockedFrontendInstallMarker < rustClippyMarker &&
+    frontendBuildMarker > lockedFrontendInstallMarker &&
+    frontendBuildMarker < rustClippyMarker,
+  "Rust CI must build locked frontend assets before Tauri macros run under Clippy.",
 );
 
 const permissions = Array.isArray(capability.permissions) ? capability.permissions : [];

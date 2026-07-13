@@ -188,7 +188,7 @@ Across the golden path and every injected error, assert Aster creates no applica
 
 ### `AC-030` — Dependency and CI assurance
 
-For the release revision, retain lockfile review, formatter/type/lint/test/clippy/static-analysis results, secret scan, dependency vulnerability/license/policy reports, and an SBOM covering shipped JavaScript, Rust, and native components. Any exploitable high/critical finding either blocks release or links to a valid unexpired exception record.
+For the release revision, retain lockfile review, formatter/type/lint/test/clippy/static-analysis results, secret scan, dependency vulnerability/license/policy reports, and an SBOM covering shipped JavaScript, Rust, and native components. Inventory every workflow `uses:` reference, prove that each is a reviewed immutable 40-character commit SHA, verify that its action runtime is supported by the hosted runner, and review all workflow annotations. Any exploitable high/critical finding either blocks release or links to a valid unexpired exception record.
 
 ### `AC-031` — Installer, update, and provenance integrity
 
