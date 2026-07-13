@@ -12,6 +12,16 @@ Aster combines a native Tauri shell, a React and TypeScript interface, a Rust tr
 
 > **Project status:** `v0.1.0` is an unsigned MVP v1 engineering implementation for local evaluation. It is not a signed production release, and the complete clean-profile Windows acceptance campaign remains outstanding. Revision-specific results must follow the [evidence policy](docs/evidence/README.md) and report exact `PASS`, `FAIL`, and `NOT RUN` outcomes.
 
+## MVP v1 preview
+
+<p align="center">
+  <img src="assets/Aster-MVP-v1-preview.png" alt="Aster Desktop MVP v1 browser demo showing the new-conversation screen" width="1200" />
+</p>
+
+<p align="center">
+  <em>Aster Desktop MVP v1 browser demo. This preview demonstrates the interface only; it is not evidence of native Windows, provider, persistence, credential-storage, packaging, or signing behavior.</em>
+</p>
+
 ## Highlights
 
 - Streamed `glm-5.1` responses with ordered deltas and real Rust-side cancellation.

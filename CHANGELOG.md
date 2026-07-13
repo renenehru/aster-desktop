@@ -7,6 +7,7 @@ All notable project changes are recorded in this file. The format follows [Keep 
 ### Added
 
 - Professional contributor onboarding, governance, support, issue, pull-request, testing, release, troubleshooting, and roadmap documentation.
+- A versioned MVP v1 browser-demo preview in the project README, with its verification scope stated explicitly.
 
 ### Changed
 
