@@ -1,0 +1,11 @@
+node_modules
+dist
+coverage
+outputs
+work
+src-tauri/target
+src-tauri/gen
+.git
+.pnpm-store
+pnpm-lock.yaml
+*.sqlite3

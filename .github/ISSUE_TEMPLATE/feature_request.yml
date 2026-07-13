@@ -1,0 +1,73 @@
+name: Feature request
+description: Propose a product change using Aster Desktop's specification-first workflow.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature proposals are evaluated against the MVP boundary, least privilege, data handling, and verification cost. A proposal is not authorization to implement behavior before its specification and acceptance criteria are accepted.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and the product specification for this proposal.
+          required: true
+        - label: I have not included credentials, private conversations, or sensitive security details.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Describe the user outcome and evidence for the need, without prescribing an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Proposed outcome
+      description: Explain observable behavior, important failure states, and explicit non-goals.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Expected product scope
+      options:
+        - MVP v1 refinement
+        - Post-MVP capability
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: trust
+    attributes:
+      label: Data and trust-boundary impact
+      description: Identify data classifications, retention, provider calls, credentials, IPC, filesystem access, native dialogs, networking, or external services that may be affected.
+      placeholder: "No new data or boundary, or describe each proposed change."
+    validations:
+      required: true
+  - type: textarea
+    id: permissions
+    attributes:
+      label: Permissions and dependencies
+      description: Identify any new Tauri capability, OS permission, dependency class, runtime service, or executable code requirement. Write "None" when applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Acceptance and verification ideas
+      description: Suggest deterministic normal, boundary, failure, cancellation, abuse, accessibility, and rollback checks.
+    validations:
+      required: true
+  - type: input
+    id: related
+    attributes:
+      label: Related requirements, threats, decisions, or issues
+      placeholder: "FR-..., SEC-..., TM-..., ADR-..., #..."
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and tradeoffs
+      description: Describe simpler alternatives, compatibility constraints, and residual risks.

@@ -1,0 +1,87 @@
+name: Bug report
+description: Report a reproducible defect in documented Aster Desktop behavior.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Aster Desktop. Search existing issues first. Do not include API keys, authorization data, personal conversations, database rows, private paths, or unredacted logs. Report security vulnerabilities privately through SECURITY.md.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues for this defect.
+          required: true
+        - label: This report contains no credentials, personal conversation data, or other sensitive information.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Source revision or artifact
+      description: Provide the commit identifier, version, or exact engineering artifact name. State whether the source was modified.
+      placeholder: "Commit abc123 (clean) or Aster 0.1.0 engineering build"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - Packaged Windows desktop application
+        - Desktop development build
+        - Browser-only demo
+        - Build, test, or CI tooling
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Windows edition/version/build, architecture, WebView2 version, display scale, and relevant tool versions. Use no personal paths.
+      placeholder: |
+        Windows: Windows 11 24H2, build ...
+        Architecture: x64
+        WebView2: ...
+        Display scale: 150%
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use deterministic steps and synthetic, non-sensitive data.
+      placeholder: |
+        1. Start ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include stable Aster error codes and safe metadata when available. Explain what any attached screenshot actually demonstrates.
+    validations:
+      required: true
+  - type: input
+    id: requirements
+    attributes:
+      label: Related requirement or acceptance criteria
+      description: Add PR-, FR-, UX-, NFR-, SEC-, or AC- identifiers if known.
+      placeholder: "FR-014, AC-..."
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression and additional context
+      description: State whether this worked before and include the last known working revision. Add only redacted, non-sensitive evidence.

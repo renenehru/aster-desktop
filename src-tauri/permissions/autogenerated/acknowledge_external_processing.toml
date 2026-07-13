@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-acknowledge-external-processing"
+description = "Enables the acknowledge_external_processing command without any pre-configured scope."
+commands.allow = ["acknowledge_external_processing"]
+
+[[permission]]
+identifier = "deny-acknowledge-external-processing"
+description = "Denies the acknowledge_external_processing command without any pre-configured scope."
+commands.deny = ["acknowledge_external_processing"]

@@ -1,0 +1,56 @@
+name: Documentation issue
+description: Report missing, inaccurate, unclear, or inconsistent project documentation.
+title: "[Docs]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Documentation must remain in English and must not overstate implementation, verification, signing, or release status. Do not include credentials, personal conversations, private paths, or other sensitive information.
+  - type: input
+    id: location
+    attributes:
+      label: Document and location
+      description: Link the file and identify the heading or line where possible.
+      placeholder: "docs/architecture.md — Network boundary"
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Issue type
+      options:
+        - Inaccurate or stale content
+        - Missing documentation
+        - Unclear instructions
+        - Broken link or formatting
+        - Specification or traceability conflict
+        - Accessibility or language issue
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Explain what is wrong and the effect on users or contributors.
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: Suggested correction
+      description: Provide proposed wording or the facts that should be verified.
+  - type: input
+    id: traceability
+    attributes:
+      label: Related requirement, decision, threat, or evidence
+      placeholder: "SEC-..., ADR-..., AC-..., docs/evidence/..."
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues for this documentation problem.
+          required: true
+        - label: This report contains no sensitive information.
+          required: true

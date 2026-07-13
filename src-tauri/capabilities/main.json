@@ -1,0 +1,30 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Least-privilege IPC capability for the bundled Aster main window.",
+  "windows": ["main"],
+  "platforms": ["windows"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "allow-app-status",
+    "allow-credential-status",
+    "allow-acknowledge-external-processing",
+    "allow-prompt-store-api-key",
+    "allow-delete-api-key",
+    "allow-list-conversations",
+    "allow-get-conversation",
+    "allow-create-conversation",
+    "allow-rename-conversation",
+    "allow-delete-conversation",
+    "allow-send-message",
+    "allow-cancel-generation",
+    "allow-export-conversation",
+    "allow-import-conversations",
+    "allow-open-external-url"
+  ]
+}

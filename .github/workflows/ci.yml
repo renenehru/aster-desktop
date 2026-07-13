@@ -1,0 +1,105 @@
+name: Secure verification
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend quality and security
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 11.7.0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+      - name: Check formatting
+        run: pnpm format:check
+      - name: Run tests with coverage gates
+        run: pnpm test:coverage
+      - name: Run the standalone type check
+        run: pnpm typecheck
+      - name: Build production frontend
+        run: pnpm build
+      - name: Scan tracked content for secrets
+        run: pnpm security:secrets
+      - name: Assert security configuration
+        run: pnpm security:config
+      - name: Audit production dependencies
+        run: pnpm audit --audit-level high --prod
+      - name: Enforce frontend license policy
+        run: pnpm license:frontend
+      - name: Generate CycloneDX SBOM
+        run: pnpm sbom:frontend
+      - name: Retain frontend SBOM evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-frontend-${{ github.sha }}
+          path: work/sbom-frontend.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
+  rust:
+    name: Rust quality and security
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-msvc
+      - name: Set up Node.js for policy and SBOM scripts
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.14.0
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: "src-tauri -> target"
+      - name: Verify formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Check every Rust workspace target
+        run: cargo check --manifest-path src-tauri/Cargo.toml --workspace --all-targets --all-features --locked
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --all-targets --all-features --locked
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          working-directory: src-tauri
+      - name: Enforce Rust license policy
+        run: node scripts/rust-license-policy.mjs
+      - name: Generate CycloneDX SBOM
+        run: node scripts/generate-rust-sbom.mjs
+      - name: Retain Rust SBOM evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-rust-${{ github.sha }}
+          path: work/sbom-rust.cdx.json
+          if-no-files-found: error
+          retention-days: 90

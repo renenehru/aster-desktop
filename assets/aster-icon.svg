@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="background" x1="96" y1="64" x2="928" y2="960" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B2023"/>
+      <stop offset="1" stop-color="#0D1012"/>
+    </linearGradient>
+    <linearGradient id="aster" x1="248" y1="190" x2="796" y2="842" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#72E2D1"/>
+      <stop offset=".52" stop-color="#8BA7FF"/>
+      <stop offset="1" stop-color="#B68CFF"/>
+    </linearGradient>
+    <filter id="glow" x="120" y="120" width="784" height="784" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="228" fill="url(#background)"/>
+  <rect x="44" y="44" width="936" height="936" rx="216" stroke="#FFFFFF" stroke-opacity=".08" stroke-width="12"/>
+  <g opacity=".22" filter="url(#glow)" fill="url(#aster)">
+    <circle cx="512" cy="512" r="250"/>
+  </g>
+  <g fill="url(#aster)">
+    <path d="M512 174c93 0 134 125 64 195l-64 63-64-63c-70-70-29-195 64-195Z"/>
+    <path d="M850 512c0 93-125 134-195 64l-63-64 63-64c70-70 195-29 195 64Z" opacity=".92"/>
+    <path d="M512 850c-93 0-134-125-64-195l64-63 64 63c70 70 29 195-64 195Z" opacity=".82"/>
+    <path d="M174 512c0-93 125-134 195-64l63 64-63 64c-70 70-195 29-195-64Z" opacity=".88"/>
+  </g>
+  <rect x="430" y="430" width="164" height="164" rx="52" transform="rotate(45 512 512)" fill="#111519"/>
+  <rect x="442" y="442" width="140" height="140" rx="44" transform="rotate(45 512 512)" stroke="#FFFFFF" stroke-opacity=".08" stroke-width="8"/>
+</svg>

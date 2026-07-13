@@ -1,0 +1,8 @@
+packages:
+  - "."
+
+minimumReleaseAge: 1440
+minimumReleaseAgeStrict: true
+
+onlyBuiltDependencies:
+  - "@tauri-apps/cli"

@@ -1,0 +1,63 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+src-tauri/target/
+work/
+outputs/
+sbom*.json
+*.cdx.json
+
+# Local data and secrets
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+.env
+.env.*
+!.env.example
+
+# Tooling
+.vite/
+.vs/
+.pnpm-store/
+.idea/
+.vscode/
+*.log
+*.tmp
+*.bak
+*.orig
+*.dmp
+*.pdb
+*.tsbuildinfo
+
+# Operating systems
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated installers and signing material
+*.exe
+*.dll
+*.lib
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.msi
+*.msix
+*.appx
+*.appxbundle
+*.pvk
+*.snk
+*.jks
+*.keystore
+*.pfx
+*.p12
+*.pem
+*.key
