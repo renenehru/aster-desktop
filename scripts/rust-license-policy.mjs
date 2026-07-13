@@ -35,6 +35,7 @@ const allowedIdentifiers = new Set([
 ]);
 
 const rejected = [];
+const workspaceRejected = [];
 const workspaceMembers = new Set(metadata.workspace_members ?? []);
 
 function isAllowedExpression(expression) {
@@ -91,7 +92,14 @@ if (
 }
 
 for (const crate of metadata.packages ?? []) {
-  if (workspaceMembers.has(crate.id)) continue;
+  if (workspaceMembers.has(crate.id)) {
+    if (crate.license !== "Apache-2.0") {
+      workspaceRejected.push(
+        `${crate.name}@${crate.version}: expected Apache-2.0, received ${JSON.stringify(crate.license)}`,
+      );
+    }
+    continue;
+  }
   if (typeof crate.license !== "string" || !crate.license.trim()) {
     rejected.push(`${crate.name}@${crate.version}: missing SPDX license`);
     continue;
@@ -101,11 +109,21 @@ for (const crate of metadata.packages ?? []) {
   }
 }
 
-if (rejected.length > 0) {
-  console.error("Rust license policy failed:\n" + rejected.map((item) => `- ${item}`).join("\n"));
+if (workspaceRejected.length > 0 || rejected.length > 0) {
+  if (workspaceRejected.length > 0) {
+    console.error(
+      "Rust workspace license policy failed:\n" +
+        workspaceRejected.map((item) => `- ${item}`).join("\n"),
+    );
+  }
+  if (rejected.length > 0) {
+    console.error(
+      "Rust dependency license policy failed:\n" + rejected.map((item) => `- ${item}`).join("\n"),
+    );
+  }
   process.exitCode = 1;
 } else {
   console.log(
-    `Rust license policy passed for ${metadata.packages.length - workspaceMembers.size} third-party dependency packages.`,
+    `Rust workspace and dependency license policy passed for ${workspaceMembers.size} Apache-2.0 workspace packages and ${metadata.packages.length - workspaceMembers.size} third-party dependency packages.`,
   );
 }

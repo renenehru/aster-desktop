@@ -43,6 +43,12 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "license": "Apache-2.0",
+    "licenseFile": "../LICENSE",
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../NOTICE": "NOTICE"
+    },
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
     "shortDescription": "Local-first Z.AI desktop client",
     "longDescription": "Aster is a local-first Windows desktop client that keeps provider credentials in Windows Credential Manager."

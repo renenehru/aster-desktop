@@ -122,10 +122,14 @@ pnpm sbom:frontend
 pnpm sbom:rust
 ```
 
-The SBOM scripts write CycloneDX JSON to `work/sbom-frontend.cdx.json` and
-`work/sbom-rust.cdx.json`. Those files are dependency-manifest inventories; do
-not describe them as a binary-derived inventory of every packaged native
-component.
+The license-policy commands assert that the npm project and every Rust workspace
+package declare `Apache-2.0`, then evaluate third-party dependency expressions
+against the approved policy. The SBOM scripts write CycloneDX JSON to
+`work/sbom-frontend.cdx.json` and `work/sbom-rust.cdx.json`, including the root
+application license and manifest-reported dependency licenses. Those files are
+dependency-manifest inventories; do not describe them as a binary-derived
+inventory of every packaged native component or as complete redistribution
+compliance evidence.
 
 ## Aggregate local verification
 

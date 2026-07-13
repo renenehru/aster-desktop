@@ -2,6 +2,7 @@
   "name": "aster-desktop",
   "private": true,
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "A security-focused, local-first desktop client for the Z.AI chat API.",
   "homepage": "https://github.com/renenehru/aster-desktop#readme",
   "repository": {

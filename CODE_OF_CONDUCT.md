@@ -54,4 +54,4 @@ Retaliation against a reporter, witness, or participant in an enforcement proces
 
 ## Attribution
 
-This Code of Conduct is adapted from the [Contributor Covenant, version 2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct.html).
+Portions of this Code of Conduct are adapted from the [Contributor Covenant, version 2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct.html), created by the Contributor Covenant project and licensed under the [Creative Commons Attribution 4.0 International License](https://creativecommons.org/licenses/by/4.0/). Its Community Impact Guidelines were inspired by [Mozilla's code of conduct enforcement ladder](https://github.com/mozilla/inclusion). Aster Desktop modifications are documented in the repository history. Those adapted portions remain under CC BY 4.0; project-owned additions are available under Apache-2.0 as described in [LICENSE](LICENSE) and [NOTICE](NOTICE).

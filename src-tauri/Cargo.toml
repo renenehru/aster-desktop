@@ -1,6 +1,7 @@
 [package]
 name = "aster-desktop"
 version = "0.1.0"
+license = "Apache-2.0"
 description = "Local-first Windows client for the Z.AI chat API"
 homepage = "https://github.com/renenehru/aster-desktop"
 repository = "https://github.com/renenehru/aster-desktop"

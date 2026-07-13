@@ -13,6 +13,7 @@ Accepted decisions define the deliberate MVP architecture. `Accepted` means the 
 | `ADR-0007` | [Use a narrow custom Windows title bar](0007-custom-windows-titlebar.md)                                                            | `FR-001`, `UX-001`, `UX-005`, `SEC-017`, `AC-001`, `AC-025`, `AC-035`  | `TM-006`, `TM-012`, `TM-033`                     |
 | `ADR-0008` | [Capture provider credentials outside the webview](0008-native-credential-capture.md)                                               | `FR-006`, `SEC-001`-`SEC-005`, `SEC-017`, `SEC-018`, `SEC-020`         | `TM-001`-`TM-003`, `TM-006`, `TM-012`, `TM-035`  |
 | `ADR-0009` | [Persist no application diagnostics in MVP v1](0009-no-persistent-diagnostics.md)                                                   | `SEC-003`, `SEC-020`, `SEC-023`, `SEC-029`-`SEC-031`                   | `TM-002`, `TM-004`, `TM-029`, `TM-034`           |
+| `ADR-0010` | [License project-owned work under Apache-2.0](0010-apache-2.0-project-license.md)                                                   | `SEC-043`-`SEC-045`, `AC-037`-`AC-039`                                 | None; licensing governance decision              |
 
 ## ADR rules
 

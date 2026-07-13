@@ -11,6 +11,7 @@ All notable project changes are recorded in this file. The format follows [Keep 
 
 ### Changed
 
+- Project-owned source code, documentation, configuration, and assets are now available under Apache License 2.0, with Contributor Covenant material retained under CC BY 4.0 and package/SBOM metadata updated accordingly.
 - Rust CI now installs the locked frontend dependencies and builds the production web assets before invoking Tauri macros, so clean runners do not depend on an untracked local `dist/` directory.
 - Repository publication and collaboration guidance now distinguishes source publication from unsigned engineering artifacts.
 
@@ -46,4 +47,4 @@ All notable project changes are recorded in this file. The format follows [Keep 
 
 - The executable and installer are unsigned engineering artifacts.
 - The formal clean-profile Windows 11 E2E, native credential, fake TLS/SSE, accessibility/scaling, performance, packaging-inventory, provenance, and signing criteria remain unverified as recorded in the evidence report.
-- No open-source license has been selected.
+- No open-source license had been selected for the original `0.1.0` engineering snapshot; Apache-2.0 was adopted afterward under `[Unreleased]`.

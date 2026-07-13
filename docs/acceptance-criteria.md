@@ -4,7 +4,7 @@
 
 **Initial evidence state:** `NOT RUN` until a revision-specific report proves otherwise
 
-**Last updated:** 2026-07-12
+**Last updated:** 2026-07-13
 
 ## 1. How acceptance works
 
@@ -216,6 +216,18 @@ On a supported 64-bit Windows 11 clean user profile, install/launch the exact ca
 
 **Method:** unit/component keyboard test with deterministic fixtures plus network, storage, and log-spy negative assertions.
 
+### `AC-037` — Apache license and attribution consistency
+
+For an identified clean revision, compare root `LICENSE` byte-for-byte with the canonical Apache License 2.0 text; inspect `NOTICE` for all required project and third-party attribution; and prove that JavaScript, Rust, Tauri bundle, source-archive, and installed-package metadata consistently declare and carry Apache-2.0 plus `LICENSE` and `NOTICE`. Inventory separately licensed material and verify its provenance, terms, attribution, and modification status remain explicit. Controlled fixtures with a changed license text, missing notice, stripped attribution, or conflicting metadata must fail the policy gate before packaging.
+
+### `AC-038` — SBOM component-license inventory
+
+Generate the frontend and Rust SBOMs from the locked identified revision. Validate that each Aster root component has exactly the Apache-2.0 expression, every enumerated workspace and third-party component has a non-empty license expression derived from the corresponding package or Cargo metadata, and component name/version coverage reconciles with that metadata. Missing, unknown, and conflicting-license fixtures must fail. Record the generators' manifest-derived scope and do not use this result alone as binary redistribution-compliance evidence.
+
+### `AC-039` — Public binary redistribution compliance
+
+For the exact binary and installer candidate, reconcile the final package and installed-file inventory with the frontend, Rust, native, and bundled-component inventory; collect and review every applicable third-party copyright notice, attribution, and license text; prove the candidate contains those materials plus root `LICENSE` and `NOTICE`; and record the source revision and artifact hashes. If any component scope, required material, review, or package inspection is missing, record `NOT RUN` and do not distribute the binary or installer publicly. Source-repository publication is evaluated separately by `AC-037`.
+
 ## 5. Product traceability matrix
 
 | Requirement | Acceptance criteria                              |
@@ -294,16 +306,19 @@ On a supported 64-bit Windows 11 clean user profile, install/launch the exact ca
 | `SEC-030`            | `AC-019`, `AC-020`, `AC-029`, `AC-036`                |
 | `SEC-031`            | `AC-019`, `AC-023`, `AC-029`, `AC-032`, `AC-036`      |
 | `SEC-032`            | `AC-002`, `AC-014`, `AC-015`                          |
-| `SEC-033`            | `AC-030`, `AC-033`                                    |
+| `SEC-033`            | `AC-030`, `AC-033`, `AC-038`                          |
 | `SEC-034`            | `AC-030`                                              |
-| `SEC-035`            | `AC-030`, `AC-031`                                    |
+| `SEC-035`            | `AC-030`, `AC-031`, `AC-038`                          |
 | `SEC-036`            | `AC-030`, `AC-034`                                    |
 | `SEC-037`            | `AC-031`, `AC-035`                                    |
 | `SEC-038`            | `AC-031`, `AC-033`                                    |
-| `SEC-039`            | `AC-019`, `AC-023`, `AC-032`, `AC-033`                |
+| `SEC-039`            | `AC-019`, `AC-023`, `AC-032`, `AC-033`, `AC-039`      |
 | `SEC-040`            | `AC-020`–`AC-028` as applicable to the fixed boundary |
 | `SEC-041`            | `AC-030`, `AC-034`                                    |
 | `SEC-042`            | `AC-034`                                              |
+| `SEC-043`            | `AC-037`, `AC-039`                                    |
+| `SEC-044`            | `AC-030`, `AC-038`                                    |
+| `SEC-045`            | `AC-039`                                              |
 
 ## 7. Threat-to-evidence traceability
 
@@ -329,7 +344,8 @@ A release report must state each item, not merely say “all checks passed”:
 - Windows version, architecture, WebView2 version, display-scale/accessibility matrix;
 - frontend format/type/lint/test and Rust format/clippy/test results;
 - secret, static, dependency vulnerability/license/policy scan results;
-- SBOM location and coverage;
+- SBOM location, component/version/license coverage, validation result, and declared scope;
+- canonical project-license/NOTICE policy results and packaged third-party redistribution materials;
 - CSP, Tauri capability, bundle, remote-origin, and package inventory results;
 - migration and import-abuse result summaries;
 - signature status and post-package verification;

@@ -1,5 +1,11 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import process from "node:process";
+
+const projectPackage = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+);
+const projectLicenseValid = projectPackage.license === "Apache-2.0";
 
 const pnpmEntrypoint = process.env.npm_execpath;
 if (!pnpmEntrypoint) {
@@ -28,11 +34,18 @@ const allowedLicenses = new Set([
 ]);
 const rejected = Object.keys(report).filter((license) => !allowedLicenses.has(license));
 
-if (rejected.length > 0) {
-  console.error(`Frontend license policy failed for: ${rejected.join(", ")}`);
+if (!projectLicenseValid || rejected.length > 0) {
+  if (!projectLicenseValid) {
+    console.error(
+      `Frontend project license must be Apache-2.0; received ${JSON.stringify(projectPackage.license)}.`,
+    );
+  }
+  if (rejected.length > 0) {
+    console.error(`Frontend dependency license policy failed for: ${rejected.join(", ")}`);
+  }
   process.exitCode = 1;
 } else {
   console.log(
-    `Frontend license policy passed for ${Object.keys(report).length} license expressions.`,
+    `Frontend project and dependency license policy passed for Apache-2.0 and ${Object.keys(report).length} dependency license expressions.`,
   );
 }

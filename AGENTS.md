@@ -107,6 +107,7 @@ Conflicts must be corrected in the same change. Implementation does not silently
 
 ### 3.5 Dependencies and supply chain
 
+- Project-owned source code, documentation, configuration, and assets are licensed under Apache-2.0 unless a file is explicitly identified as separately licensed. Preserve the canonical `LICENSE`, `NOTICE`, package and bundle metadata, and SBOM root-license expressions. Do not silently relicense third-party material; record its provenance, terms, attribution, and modification status.
 - Lock JavaScript and Rust dependency versions. Commit and review lockfile changes.
 - Prefer maintained, narrowly scoped packages. Document why a new runtime dependency is required and assess its license, maintenance, transitive footprint, and security history.
 - Do not run untrusted lifecycle scripts or download executable code at runtime.

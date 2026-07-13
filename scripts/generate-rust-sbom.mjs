@@ -17,6 +17,19 @@ const metadata = JSON.parse(
   ),
 );
 
+// Cargo historically allowed `/` as an alternative separator. SPDX uses the
+// explicit `OR` operator, so normalize the legacy spelling before placing a
+// dependency license expression in the CycloneDX document. This is the same
+// normalization applied by the Rust dependency license policy.
+const normalizeCargoLicenseExpression = (expression) => expression.replace(/\s*\/\s*/g, " OR ");
+
+if (
+  normalizeCargoLicenseExpression("MIT/Apache-2.0") !== "MIT OR Apache-2.0" ||
+  normalizeCargoLicenseExpression("Apache-2.0 / MIT") !== "Apache-2.0 OR MIT"
+) {
+  throw new Error("Cargo legacy license-expression normalization failed its built-in fixtures.");
+}
+
 const byId = new Map((metadata.packages ?? []).map((crate) => [crate.id, crate]));
 const components = (metadata.packages ?? [])
   .filter((crate) => crate.name !== "aster-desktop")
@@ -26,7 +39,9 @@ const components = (metadata.packages ?? [])
       type: "library",
       name: crate.name,
       version: crate.version,
-      licenses: crate.license ? [{ expression: crate.license }] : undefined,
+      licenses: crate.license
+        ? [{ expression: normalizeCargoLicenseExpression(crate.license) }]
+        : undefined,
       purl: reference,
       "bom-ref": reference,
     };
@@ -55,6 +70,9 @@ const dependencies = resolveNodes
 
 const rootPackage = (metadata.packages ?? []).find((crate) => crate.name === "aster-desktop");
 if (!rootPackage) throw new Error("The Aster Rust package was not present in Cargo metadata.");
+if (rootPackage.license !== "Apache-2.0") {
+  throw new Error("The Rust application license must be Apache-2.0 before SBOM generation.");
+}
 const rootReference = `pkg:cargo/${rootPackage.name}@${rootPackage.version}`;
 const sbom = {
   bomFormat: "CycloneDX",
@@ -67,6 +85,7 @@ const sbom = {
       type: "application",
       name: rootPackage.name,
       version: rootPackage.version,
+      licenses: [{ expression: rootPackage.license }],
       purl: rootReference,
       "bom-ref": rootReference,
     },

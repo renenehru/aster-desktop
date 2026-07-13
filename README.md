@@ -93,10 +93,10 @@ See the [development guide](docs/development.md) for fresh-laptop setup and tool
 
 ## Quick start
 
-Clone the private repository with an authenticated GitHub account:
+Clone the repository:
 
 ```powershell
-gh repo clone renenehru/aster-desktop
+git clone https://github.com/renenehru/aster-desktop.git
 Set-Location aster-desktop
 ```
 
@@ -183,6 +183,8 @@ Conversation content is stored locally in user-scoped SQLite without application
 
 Never commit API keys, conversation exports, user databases, signing material, or private evidence. The repository secret scan is a release gate, not a replacement for credential hygiene.
 
-## Licensing status
+## License
 
-No open-source license has been selected for this repository. Keep the repository private and do not redistribute the source or binaries until the project owner makes and records a licensing decision.
+Except where otherwise noted, Aster Desktop's project-owned source code, documentation, configuration, and assets are licensed under the [Apache License 2.0](LICENSE). You may use, modify, and distribute the work subject to that license, including its requirements to provide the license, preserve applicable notices, and identify modified files. Apache-2.0 also includes a conditional patent grant, does not grant trademark rights, and provides the work without warranty.
+
+See [NOTICE](NOTICE) for required attribution and separately licensed material. In particular, portions of [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) are adapted from Contributor Covenant 2.1 under CC BY 4.0. Third-party dependencies and bundled third-party components retain their respective licenses; consult the lockfiles, generated CycloneDX SBOMs, and dependency license reports before redistribution.

@@ -143,6 +143,7 @@ The packaging script requires all of the following inputs:
 
 - the release executable and NSIS installer from the engineering build;
 - `work/sbom-frontend.cdx.json` and `work/sbom-rust.cdx.json` from verification;
+- the canonical `LICENSE` and attribution `NOTICE` files;
 - the selected evidence record;
 - `outputs/Aster-MVP-v1-preview.png` as the current preview input;
 - a production `dist/` bundle for the package audit.
@@ -156,12 +157,20 @@ powershell -ExecutionPolicy Bypass -File scripts/package-engineering.ps1 `
 ```
 
 The script requires a clean Git working tree and a tracked evidence record. It
-reruns the package audit, copies the executable, installer, and both SBOMs,
+reruns the package audit, copies the executable, installer, both SBOMs,
+`LICENSE`, and `NOTICE`,
 creates the source snapshot from the exact `HEAD` tracked-file inventory with
 `git archive`, appends the source revision and artifact identity to
 `outputs/verification-report.md`, and writes `outputs/SHA256SUMS.txt`. Ignored
 and untracked workspace files are excluded by construction; do not replace this
 with directory-wide archiving and a denylist.
+
+The current engineering packaging script does not generate or verify a
+consolidated bundle of all third-party copyright notices and license texts.
+The `SEC-045` / `AC-039` redistribution-compliance gate is therefore `NOT RUN` and blocks public
+distribution of binary or installer packages until the applicable material is
+collected, reviewed, packaged, and recorded as revision-specific evidence. It
+does not block publication of the source repository under Apache-2.0.
 
 Review the generated report and hashes before sharing. Verify an artifact by
 recomputing its hash with PowerShell and comparing it with the checksum file:
@@ -199,4 +208,5 @@ items together:
 - revision-specific verification report with all `NOT RUN` items;
 - SHA-256 checksum file obtained through a trusted channel;
 - frontend and Rust SBOMs with their stated manifest-derived scope;
+- the Apache-2.0 `LICENSE`, attribution `NOTICE`, and all applicable third-party license material;
 - residual risks, valid exceptions, and safe installation/removal instructions.

@@ -93,4 +93,6 @@ At least one maintainer review is expected before merge. Security-sensitive chan
 
 ## Licensing
 
-The repository currently has no open-source license. Do not redistribute project source or binaries, and confirm contribution and licensing terms with the project owner before contributing code intended for public distribution.
+Except where otherwise noted, the project-owned work is licensed under the [Apache License 2.0](LICENSE). Under section 5 of that license, a contribution intentionally submitted for inclusion in Aster Desktop is provided under Apache-2.0 without additional terms unless the contributor explicitly states otherwise or a separate written agreement applies. No copyright assignment is required.
+
+By submitting a contribution, you confirm that you have the right to provide it under those terms. Identify copied, generated, or third-party material and preserve its provenance, license, copyright, and attribution requirements. Do not submit material with terms that are incompatible with the repository or that you are not authorized to license. See [NOTICE](NOTICE) for the Contributor Covenant exception and existing third-party attribution.

@@ -2,7 +2,7 @@
 
 **Status:** non-normative planning document
 
-**Last updated:** 2026-07-12
+**Last updated:** 2026-07-13
 
 This roadmap communicates likely sequencing. It does not authorize implementation, grant permissions, or override [AGENTS.md](../AGENTS.md), accepted ADRs, security requirements, or the product specification. Every behavior-changing item starts with stable requirements and acceptance criteria.
 
@@ -21,7 +21,7 @@ Exit condition: every criterion required for the Engineering MVP classification 
 
 ## Phase 2 — Production release readiness
 
-- Select and document an open-source or proprietary licensing model.
+- [x] Adopt and document Apache License 2.0 for project-owned work (completed 2026-07-13).
 - Establish protected GitHub collaboration, required reviews, and retained CI evidence.
 - Provision an authorized Windows signing identity and document secure key custody.
 - Produce a binary-derived package inventory and reconcile it with CycloneDX dependency SBOMs.

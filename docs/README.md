@@ -18,6 +18,7 @@ engineering governance and has precedence over every document listed here.
 | Resolve a local build or runtime problem      | [Troubleshooting](troubleshooting.md)                      |
 | Contribute a change                           | [Contributing guide](../CONTRIBUTING.md)                   |
 | Report a vulnerability                        | [Security policy](../SECURITY.md)                          |
+| Understand reuse and redistribution terms     | [Apache-2.0 license](../LICENSE) and [NOTICE](../NOTICE)   |
 
 ## Normative product and security documents
 

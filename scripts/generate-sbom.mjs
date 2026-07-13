@@ -5,6 +5,9 @@ import process from "node:process";
 
 const root = process.cwd();
 const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+if (packageJson.license !== "Apache-2.0") {
+  throw new Error("The frontend project license must be Apache-2.0 before SBOM generation.");
+}
 const pnpmEntrypoint = process.env.npm_execpath;
 if (!pnpmEntrypoint) {
   throw new Error("Run this generator through the pnpm sbom:frontend script.");
@@ -15,6 +18,26 @@ const rawTree = execFileSync(
   { cwd: root, encoding: "utf8", windowsHide: true },
 );
 const [tree] = JSON.parse(rawTree);
+const licenseReport = JSON.parse(
+  execFileSync(process.execPath, [pnpmEntrypoint, "licenses", "list", "--prod", "--json"], {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+  }),
+);
+const licenseByPackageVersion = new Map();
+for (const [expression, packages] of Object.entries(licenseReport)) {
+  for (const packageEntry of packages ?? []) {
+    for (const version of packageEntry.versions ?? []) {
+      const key = `${packageEntry.name}@${version}`;
+      const previous = licenseByPackageVersion.get(key);
+      if (previous && previous !== expression) {
+        throw new Error(`Conflicting license expressions for ${key}: ${previous}, ${expression}`);
+      }
+      licenseByPackageVersion.set(key, expression);
+    }
+  }
+}
 
 const components = new Map();
 const dependencies = new Map();
@@ -22,11 +45,16 @@ const dependencies = new Map();
 function visit(name, node) {
   if (!node || typeof node !== "object" || typeof node.version !== "string") return null;
   const reference = `pkg:npm/${encodeURIComponent(name)}@${encodeURIComponent(node.version)}`;
+  const licenseExpression = licenseByPackageVersion.get(`${name}@${node.version}`);
+  if (!licenseExpression) {
+    throw new Error(`No dependency license expression was found for ${name}@${node.version}.`);
+  }
   if (!components.has(reference)) {
     components.set(reference, {
       type: "library",
       name,
       version: node.version,
+      licenses: [{ expression: licenseExpression }],
       purl: reference,
       "bom-ref": reference,
     });
@@ -67,6 +95,7 @@ const sbom = {
       type: "application",
       name: packageJson.name,
       version: packageJson.version,
+      licenses: [{ expression: packageJson.license }],
       purl: rootReference,
       "bom-ref": rootReference,
     },

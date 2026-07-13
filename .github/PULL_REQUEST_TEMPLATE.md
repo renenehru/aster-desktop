@@ -37,6 +37,7 @@
 - [ ] No wildcard or out-of-scope Tauri, network, filesystem, URL, process, or shell permission was added.
 - [ ] CSP, external navigation, redaction, cancellation, and persistence impacts were reviewed where applicable.
 - [ ] New or changed dependencies have a documented need, license, maintenance, footprint, and security assessment.
+- [ ] I am authorized to submit this contribution under Apache-2.0 and have identified all third-party material and required attribution.
 - [ ] Security regression tests were added for every vulnerability fixed.
 
 ## User experience and documentation

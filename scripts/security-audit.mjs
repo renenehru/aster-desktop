@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -6,6 +7,15 @@ const root = process.cwd();
 
 async function read(relativePath) {
   return readFile(path.join(root, relativePath), "utf8");
+}
+
+async function readOptional(relativePath) {
+  try {
+    return await read(relativePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return "";
+    throw error;
+  }
 }
 
 async function matchingFiles(directory, matches) {
@@ -51,8 +61,18 @@ const vite = await read("vite.config.ts");
 const indexHtml = await read("index.html");
 const packageRaw = await read("package.json");
 const packageManifest = JSON.parse(packageRaw);
+const projectLicense = await readOptional("LICENSE");
+const projectNotice = await readOptional("NOTICE");
+const licensingDocumentation = await combine([
+  "README.md",
+  "CONTRIBUTING.md",
+  "docs/collaboration-workflow.md",
+  "docs/roadmap.md",
+]);
 const environmentExample = await read(".env.example");
 const packageEngineering = await read("scripts/package-engineering.ps1");
+const frontendSbomGenerator = await read("scripts/generate-sbom.mjs");
+const rustSbomGenerator = await read("scripts/generate-rust-sbom.mjs");
 const ciWorkflow = await read(".github/workflows/ci.yml");
 const mainCargo = await read("src-tauri/Cargo.toml");
 const helperCargo = await read("src-tauri/credential-prompt/Cargo.toml");
@@ -118,6 +138,71 @@ assert(
 assert(
   !packageEngineering.includes("--exclude=") && !packageEngineering.includes("tar.exe"),
   "Source packaging must not archive the working directory through a hard-coded denylist.",
+);
+assert(
+  createHash("sha256").update(projectLicense).digest("hex") ===
+    "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "LICENSE must be the unmodified canonical Apache License 2.0 text.",
+);
+assert(
+  packageManifest.license === "Apache-2.0" && packageManifest.private === true,
+  "The npm package must declare Apache-2.0 while retaining the accidental-publication guard.",
+);
+assert(
+  /^license\s*=\s*"Apache-2\.0"$/m.test(mainCargo) &&
+    /^license\s*=\s*"Apache-2\.0"$/m.test(helperCargo),
+  "Every Rust workspace package must declare Apache-2.0.",
+);
+assert(
+  tauri.bundle?.license === "Apache-2.0" &&
+    tauri.bundle?.licenseFile === "../LICENSE" &&
+    tauri.bundle?.resources?.["../LICENSE"] === "LICENSE" &&
+    tauri.bundle?.resources?.["../NOTICE"] === "NOTICE",
+  "Tauri bundles must declare Apache-2.0 and install the canonical license and notice files.",
+);
+assert(
+  projectNotice.startsWith("Aster Desktop\n") &&
+    projectNotice.includes("Contributor Covenant, version 2.1") &&
+    projectNotice.includes("https://creativecommons.org/licenses/by/4.0/") &&
+    projectNotice.includes("https://github.com/mozilla/inclusion"),
+  "NOTICE must preserve the project attribution, Contributor Covenant CC BY 4.0 notice, and Mozilla attribution.",
+);
+assert(
+  /Copy-Item\s+-LiteralPath\s+\$license\s+-Destination\s+\$licenseOutput/.test(
+    packageEngineering,
+  ) &&
+    /Copy-Item\s+-LiteralPath\s+\$notice\s+-Destination\s+\$noticeOutput/.test(packageEngineering),
+  "Engineering handoffs must copy LICENSE and NOTICE beside distributable artifacts.",
+);
+assert(
+  /\$identityTargets\s*=\s*@\([\s\S]*?\$licenseOutput[\s\S]*?\$noticeOutput[\s\S]*?\)/.test(
+    packageEngineering,
+  ),
+  "Engineering artifact identity and checksums must cover LICENSE and NOTICE.",
+);
+assert(
+  frontendSbomGenerator.includes("licenses: [{ expression: packageJson.license }]") &&
+    rustSbomGenerator.includes("licenses: [{ expression: rootPackage.license }]") &&
+    frontendSbomGenerator.includes('packageJson.license !== "Apache-2.0"') &&
+    rustSbomGenerator.includes('rootPackage.license !== "Apache-2.0"'),
+  "Both SBOM root components must carry the verified Apache-2.0 expression.",
+);
+assert(
+  rustSbomGenerator.includes("const normalizeCargoLicenseExpression = (expression) =>") &&
+    rustSbomGenerator.includes('expression.replace(/\\s*\\/\\s*/g, " OR ")') &&
+    rustSbomGenerator.includes(
+      "licenses: crate.license\n        ? [{ expression: normalizeCargoLicenseExpression(crate.license) }]",
+    ) &&
+    rustSbomGenerator.includes(
+      'normalizeCargoLicenseExpression("MIT/Apache-2.0") !== "MIT OR Apache-2.0"',
+    ),
+  "Rust SBOM dependency licenses must normalize Cargo legacy slash alternatives to SPDX OR expressions.",
+);
+assert(
+  !/no open-source license has been selected|repository currently has no open-source license|keep the repository private until|do not redistribute project source/i.test(
+    licensingDocumentation,
+  ),
+  "Current contributor documentation must not retain the pre-license distribution restrictions.",
 );
 assert(
   !/^\s*[A-Z][A-Z0-9_]*\s*=/m.test(environmentExample),

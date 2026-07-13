@@ -12,7 +12,7 @@ There is currently no supported production release.
 
 ## Reporting a vulnerability
 
-Do not open an issue containing exploit details, API keys, conversation content, or personal data. GitHub's private vulnerability-reporting intake is not available while this repository remains private. Contact the repository owner privately through GitHub and wait for confirmation of a secure reporting channel before sending technical details. A maintainer will preserve the report in a restricted security record and coordinate remediation without moving sensitive details into an issue or pull request.
+Do not open an issue containing exploit details, API keys, conversation content, or personal data. Use [GitHub private vulnerability reporting](https://github.com/renenehru/aster-desktop/security/advisories/new) when it is available. If that intake is unavailable, contact the repository owner privately through GitHub and wait for confirmation of a secure reporting channel before sending technical details. A maintainer will preserve the report in a restricted security record and coordinate remediation without moving sensitive details into an issue or pull request.
 
 Include only the minimum non-sensitive information needed to triage:
 

@@ -42,6 +42,8 @@ $releaseBinary = Join-Path $root "src-tauri\target\release\aster-desktop.exe"
 $installer = Join-Path $root "src-tauri\target\release\bundle\nsis\Aster_0.1.0_x64-setup.exe"
 $frontendSbom = Join-Path $root "work\sbom-frontend.cdx.json"
 $rustSbom = Join-Path $root "work\sbom-rust.cdx.json"
+$license = Join-Path $root "LICENSE"
+$notice = Join-Path $root "NOTICE"
 $preview = Join-Path $output "Aster-MVP-v1-preview.png"
 $evidence = Join-Path $root $EvidenceRecord
 $evidenceRelative = $EvidenceRecord.Replace("\", "/")
@@ -57,7 +59,7 @@ if (-not (Test-Path -LiteralPath $releaseBinary -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "The NSIS engineering installer does not exist. Run the Tauri engineering build first."
 }
-foreach ($required in @($frontendSbom, $rustSbom, $preview, $evidence)) {
+foreach ($required in @($frontendSbom, $rustSbom, $license, $notice, $preview, $evidence)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required packaging input is missing: $required"
     }
@@ -72,6 +74,8 @@ $portableOutput = Join-Path $output "Aster-0.1.0-x64-engineering.exe"
 $installerOutput = Join-Path $output "Aster-0.1.0-x64-engineering-setup.exe"
 $frontendSbomOutput = Join-Path $output "sbom-frontend.cdx.json"
 $rustSbomOutput = Join-Path $output "sbom-rust.cdx.json"
+$licenseOutput = Join-Path $output "LICENSE"
+$noticeOutput = Join-Path $output "NOTICE"
 $sourceArchive = Join-Path $output "Aster-MVP-v1-source.zip"
 $verification = Join-Path $output "verification-report.md"
 $checksumPath = Join-Path $output "SHA256SUMS.txt"
@@ -81,6 +85,8 @@ foreach ($stale in @(
         $installerOutput,
         $frontendSbomOutput,
         $rustSbomOutput,
+        $licenseOutput,
+        $noticeOutput,
         $sourceArchive,
         $verification,
         $checksumPath
@@ -94,6 +100,8 @@ Copy-Item -LiteralPath $releaseBinary -Destination $portableOutput -Force
 Copy-Item -LiteralPath $installer -Destination $installerOutput -Force
 Copy-Item -LiteralPath $frontendSbom -Destination $frontendSbomOutput -Force
 Copy-Item -LiteralPath $rustSbom -Destination $rustSbomOutput -Force
+Copy-Item -LiteralPath $license -Destination $licenseOutput -Force
+Copy-Item -LiteralPath $notice -Destination $noticeOutput -Force
 
 & $git -C $root archive --format=zip --output=$sourceArchive HEAD
 if ($LASTEXITCODE -ne 0) {
@@ -106,6 +114,8 @@ $identityTargets = @(
     $sourceArchive,
     $frontendSbomOutput,
     $rustSbomOutput,
+    $licenseOutput,
+    $noticeOutput,
     $preview
 )
 $identityRows = foreach ($path in $identityTargets) {

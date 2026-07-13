@@ -4,7 +4,7 @@ This guide describes the recommended Git and GitHub workflow for working on Aste
 
 ## Repository policy
 
-- Keep the repository private until the owner has selected a license and explicitly approved public distribution.
+- The project-owned work is publicly available under Apache-2.0; preserve [LICENSE](../LICENSE), [NOTICE](../NOTICE), modified-file notices, and any separately licensed material when redistributing it.
 - Use `main` as the protected integration branch.
 - Make changes on short-lived branches and merge through pull requests.
 - Give normal collaborators **Write** access, not **Admin** access.
@@ -22,7 +22,7 @@ git config --global user.name "Your Name"
 git config --global user.email "your-verified-email@example.com"
 ```
 
-Clone the private repository and bootstrap the locked dependencies:
+Clone the repository and bootstrap the locked dependencies:
 
 ```powershell
 gh repo clone renenehru/aster-desktop
@@ -108,11 +108,11 @@ pnpm install --frozen-lockfile
 
 Do not copy the working directory through cloud storage or removable media as a synchronization strategy. A clone plus locked dependency installation avoids copying credentials, local databases, generated artifacts, stale build caches, or machine-specific state.
 
-If work is not ready to share, create a private draft commit on the feature branch rather than copying untracked files between machines. Never commit a secret merely to move it.
+If work is not ready to share, create a local draft commit on the feature branch rather than copying untracked files between machines. Never commit a secret merely to move it.
 
 ## Update a branch from `main`
 
-Fetch the latest source and rebase a private feature branch when the team has agreed to that workflow:
+Fetch the latest source and rebase a feature branch when the team has agreed to that workflow:
 
 ```powershell
 git fetch origin
@@ -136,7 +136,7 @@ Prefer squash merge for a noisy branch or a normal merge when preserving a delib
 
 ## Invite collaborators safely
 
-From the repository settings, invite each trusted engineer by their exact GitHub username and grant **Write** access. Ask collaborators to enable two-factor authentication and protect their GitHub account. Review access periodically and remove accounts that no longer need it.
+Community contributors should fork the public repository and submit pull requests without direct write access. Invite only trusted maintainers by their exact GitHub username and grant **Write** access rather than **Admin** access. Ask maintainers to enable two-factor authentication and protect their GitHub account. Review access periodically and remove accounts that no longer need it.
 
 Do not share one GitHub account, personal access token, SSH private key, signing key, or Z.AI API key among collaborators. Each contributor uses their own identity and local credential store.
 
@@ -149,7 +149,7 @@ powershell -ExecutionPolicy Bypass -File scripts/package-engineering.ps1 `
   -EvidenceRecord "docs\evidence\YYYY-MM-DD-<revision>-engineering-build.md"
 ```
 
-The script uses `git archive` on `HEAD`; ignored and untracked workspace files are excluded by construction. Do not zip the working directory or upload the existing `outputs/` source snapshot to GitHub.
+The script uses `git archive` on `HEAD`; ignored and untracked workspace files are excluded by construction, while the tracked Apache-2.0 `LICENSE` and attribution `NOTICE` are included. Do not zip the working directory or upload the existing `outputs/` source snapshot to GitHub.
 
 ## Recovery rules
 
