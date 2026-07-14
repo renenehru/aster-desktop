@@ -238,8 +238,8 @@ try {
         -Path (Join-Path $positiveOutput "verification-report.md") `
         -MaximumBytes 1048576
     $positiveSourceLines = [regex]::Matches($positiveReport, '(?im)^\*\*Source revision:\*\*.*$').Count
-    $positiveVerifier = $positiveReport -match '(?m)^\*\*Self-declared verifier identity:\*\* fixture-reviewer$'
-    $positiveClassification = $positiveReport -match '(?m)^\*\*Overall classification:\*\* Unsigned engineering build for local evaluation$'
+    $positiveVerifier = $positiveReport -match '(?m)^\*\*Self-declared verifier identity:\*\* fixture-reviewer\r?$'
+    $positiveClassification = $positiveReport -match '(?m)^\*\*Overall classification:\*\* Unsigned engineering build for local evaluation\r?$'
     $positiveAuthenticodeHeader = $positiveReport -match '(?m)^\| File \| Bytes \| Modified UTC \| SHA-256 \| Authenticode observation \|\r?$'
     $positiveAuthenticodeRows = [regex]::Matches(
         $positiveReport,
@@ -473,7 +473,7 @@ try {
 
     $evidenceBypasses = New-FixtureRepository "evidence-bypasses"
     $canonicalEvidence = [System.IO.File]::ReadAllText($evidenceBypasses.EvidencePath, [System.Text.Encoding]::UTF8)
-    $canonicalResultRow = [regex]::Match($canonicalEvidence, '(?m)^\| `AC-031`[^\r\n]+$').Value.TrimEnd("`r")
+    $canonicalResultRow = [regex]::Match($canonicalEvidence, '(?m)^\| `AC-031`[^\r\n]+\r?$').Value.TrimEnd("`r")
     $canonicalClassification = "**Overall classification:** Unsigned engineering build for local evaluation"
     $duplicateResultRow = $canonicalResultRow.Replace("``PASS``", "``FAIL``").Replace(
         "| $($evidenceBypasses.EvidenceLogRelative) |",
