@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "aster-credential-prompt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows",
  "zeroize",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "aster-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aster-credential-prompt",
  "chrono",

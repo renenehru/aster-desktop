@@ -63,7 +63,11 @@ try {
         Invoke-NativeChecked $cargoPath @("audit", "--file", "src-tauri/Cargo.lock") "Rust dependency audit"
     }
 
-    Write-Host "Verification completed successfully."
+    if ($SkipRust) {
+        Write-Warning "Frontend, dependency-policy, and SBOM checks completed. Rust format, check, Clippy, test, and audit gates were NOT RUN because -SkipRust was selected."
+    } else {
+        Write-Host "Full frontend and Rust verification completed successfully."
+    }
 } finally {
     Pop-Location
 }

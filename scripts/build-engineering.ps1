@@ -4,7 +4,28 @@ param()
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$identityModule = Join-Path $PSScriptRoot "Aster.BuildIdentity.psm1"
+Import-Module $identityModule -Force
+$root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+[void](Assert-AsterNoReparseAncestors -Path $root)
+$git = (Get-Command git.exe -ErrorAction Stop).Source
+$topLevel = (& $git -C $root rev-parse --show-toplevel).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($topLevel)) {
+    throw "Engineering builds require an initialized Git repository."
+}
+$safeTopLevel = [System.IO.Path]::GetFullPath($topLevel)
+[void](Assert-AsterNoReparseAncestors -Path $safeTopLevel)
+if (-not [string]::Equals($safeTopLevel, $root, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "The engineering build must run from the repository that contains this source tree."
+}
+$workingTreeStatus = @(& $git -C $root status --porcelain=v1 --untracked-files=normal)
+if ($LASTEXITCODE -ne 0 -or $workingTreeStatus.Count -ne 0) {
+    throw "Engineering builds require a completely clean Git working tree."
+}
+$sourceRevision = (& $git -C $root rev-parse --verify HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceRevision -notmatch '^[0-9a-fA-F]{40,64}$') {
+    throw "The engineering-build source revision could not be identified."
+}
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
     throw "Visual Studio Installer could not be located. Install the Visual C++ x64 build tools."
@@ -55,6 +76,48 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "The engineering build failed with exit code $LASTEXITCODE."
     }
+
+    $postBuildRevision = (& $git -C $root rev-parse --verify HEAD).Trim()
+    $postBuildStatus = @(& $git -C $root status --porcelain=v1 --untracked-files=normal)
+    if (
+        $LASTEXITCODE -ne 0 -or
+        $postBuildRevision -ne $sourceRevision -or
+        $postBuildStatus.Count -ne 0
+    ) {
+        throw "The tracked source changed during the engineering build; no build identity was issued."
+    }
+
+    $releaseBinary = Join-Path $root "src-tauri\target\release\aster-desktop.exe"
+    $installer = Join-Path $root "src-tauri\target\release\bundle\nsis\Aster_0.2.0_x64-setup.exe"
+    $frontendDist = Join-Path $root "dist"
+    $frontendSbom = Join-Path $root "work\sbom-frontend.cdx.json"
+    $rustSbom = Join-Path $root "work\sbom-rust.cdx.json"
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        sourceRevision = $sourceRevision.ToLowerInvariant()
+        generatedUtc = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        artifacts = [ordered]@{
+            releaseBinary = Get-AsterFileIdentity -RepositoryRoot $root -Path $releaseBinary
+            installer = Get-AsterFileIdentity -RepositoryRoot $root -Path $installer
+        }
+        sboms = [ordered]@{
+            frontend = Get-AsterFileIdentity -RepositoryRoot $root -Path $frontendSbom
+            rust = Get-AsterFileIdentity -RepositoryRoot $root -Path $rustSbom
+        }
+        frontendDist = [ordered]@{
+            path = "dist"
+            sha256 = Get-AsterDirectoryDigest -RepositoryRoot $root -Path $frontendDist
+        }
+    }
+    $work = Join-Path $root "work"
+    New-AsterSafeDirectory -RepositoryRoot $root -Path $work | Out-Null
+    $manifestPath = Join-Path $work "build-identity.json"
+    Write-AsterUtf8Text `
+        -RepositoryRoot $root `
+        -Path $manifestPath `
+        -Content ($manifest | ConvertTo-Json -Depth 6) `
+        -AllowReplace | Out-Null
+    Write-Host "Engineering build identity written to $manifestPath for source $sourceRevision."
 } finally {
     Pop-Location
 }

@@ -3,29 +3,42 @@ use keyring::v1::{Entry, Error as KeyringError};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
-use crate::models::CredentialStatus;
+use crate::models::{CredentialStatus, ProviderId};
 
 const SERVICE: &str = "com.aster.desktop";
-const ACCOUNT: &str = "zai-api-key";
+
+pub(crate) const fn credential_target(provider: ProviderId) -> &'static str {
+    match provider {
+        // This exact legacy target is intentionally preserved for existing MVP v1 users.
+        ProviderId::Zai => "zai-api-key",
+        ProviderId::DeepSeek => "deepseek-api-key",
+        ProviderId::AlibabaUs => "alibaba-us-api-key",
+        ProviderId::Google => "google-api-key",
+        ProviderId::Nvidia => "nvidia-api-key",
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CredentialStore;
 
 impl CredentialStore {
-    fn entry(self) -> AppResult<Entry> {
-        Entry::new(SERVICE, ACCOUNT).map_err(|_| AppError::CredentialVault)
+    fn entry(self, provider: ProviderId) -> AppResult<Entry> {
+        Entry::new(SERVICE, credential_target(provider)).map_err(|_| AppError::CredentialVault)
     }
 
-    pub fn status(self) -> AppResult<CredentialStatus> {
-        match self.entry()?.get_password() {
+    pub fn status(self, provider: ProviderId) -> AppResult<CredentialStatus> {
+        match self.entry(provider)?.get_password() {
             Ok(secret) => {
                 let secret = Zeroizing::new(secret);
                 validate_api_key(secret.as_str())?;
                 Ok(CredentialStatus {
+                    provider_id: provider,
                     configured: true,
                     source: "credential-vault",
                 })
             }
             Err(KeyringError::NoEntry) => Ok(CredentialStatus {
+                provider_id: provider,
                 configured: false,
                 source: "none",
             }),
@@ -33,20 +46,26 @@ impl CredentialStore {
         }
     }
 
-    pub fn store(self, api_key: Zeroizing<String>) -> AppResult<CredentialStatus> {
+    pub fn store(
+        self,
+        provider: ProviderId,
+        api_key: Zeroizing<String>,
+    ) -> AppResult<CredentialStatus> {
         validate_api_key(api_key.as_str())?;
-        self.entry()?
+        self.entry(provider)?
             .set_password(api_key.as_str())
             .map_err(|_| AppError::CredentialVault)?;
         Ok(CredentialStatus {
+            provider_id: provider,
             configured: true,
             source: "credential-vault",
         })
     }
 
-    pub fn delete(self) -> AppResult<CredentialStatus> {
-        match self.entry()?.delete_credential() {
+    pub fn delete(self, provider: ProviderId) -> AppResult<CredentialStatus> {
+        match self.entry(provider)?.delete_credential() {
             Ok(()) | Err(KeyringError::NoEntry) => Ok(CredentialStatus {
+                provider_id: provider,
                 configured: false,
                 source: "none",
             }),
@@ -54,8 +73,8 @@ impl CredentialStore {
         }
     }
 
-    pub fn load(self) -> AppResult<Zeroizing<String>> {
-        match self.entry()?.get_password() {
+    pub fn load(self, provider: ProviderId) -> AppResult<Zeroizing<String>> {
+        match self.entry(provider)?.get_password() {
             Ok(secret) => {
                 let secret = Zeroizing::new(secret);
                 validate_api_key(secret.as_str())?;
@@ -84,6 +103,18 @@ fn validate_api_key(value: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_targets_are_exact_and_preserve_legacy_zai_target() {
+        assert_eq!(credential_target(ProviderId::Zai), "zai-api-key");
+        assert_eq!(credential_target(ProviderId::DeepSeek), "deepseek-api-key");
+        assert_eq!(
+            credential_target(ProviderId::AlibabaUs),
+            "alibaba-us-api-key"
+        );
+        assert_eq!(credential_target(ProviderId::Google), "google-api-key");
+        assert_eq!(credential_target(ProviderId::Nvidia), "nvidia-api-key");
+    }
 
     #[test]
     fn api_key_validation_enforces_the_native_prompt_bound() {

@@ -44,10 +44,10 @@ describe("Aster browser demo", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: /settings/i })[0] as HTMLElement);
     expect(await screen.findByRole("dialog", { name: "Settings" })).toBeTruthy();
-    expect(screen.getByText("No credentials in browser demo")).toBeTruthy();
-    expect(screen.getByText(/native credential workflow/i)).toBeTruthy();
+    expect(screen.getByText(/Synthetic provider catalog/i)).toBeTruthy();
+    expect(screen.getAllByText(/No key can be entered, stored, or transmitted/i)).toHaveLength(5);
     expect(screen.getAllByText("Demo only").length).toBeGreaterThan(0);
-    expect(screen.getByText("Aster v0.1.0-preview")).toBeTruthy();
+    expect(screen.getByText("Aster v0.2.0-preview")).toBeTruthy();
     expect(screen.queryByLabelText(/^API key$/i)).toBeNull();
     expect(container.querySelectorAll("#provider-settings input")).toHaveLength(0);
     expect(
@@ -162,5 +162,34 @@ describe("Aster browser demo", () => {
 
     fireEvent.keyDown(window, { key: "n", ctrlKey: true });
     expect(await screen.findByText("Start with a question")).toBeTruthy();
+  });
+
+  it("starts a new chat when a populated conversation changes model and opens advisory Usage", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Threat model review" }));
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /Choose model\. Current selection: Z\.AI · GLM-5\.1/i,
+      }),
+    );
+    expect(await screen.findByRole("dialog", { name: "Choose model" })).toBeTruthy();
+    await user.type(screen.getByRole("searchbox", { name: "Search catalog models" }), "V4 Pro");
+    await user.click(screen.getByText("DeepSeek V4 Pro"));
+    await user.click(screen.getByRole("button", { name: "Use this model" }));
+
+    expect(await screen.findByRole("dialog", { name: "Start a new chat?" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Start a new chat with this model" }));
+    expect(
+      await screen.findByRole("button", {
+        name: /Current selection: DeepSeek · DeepSeek V4 Pro/i,
+      }),
+    ).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /Usage7 days/i }));
+    expect(await screen.findByRole("dialog", { name: "Usage" })).toBeTruthy();
+    expect(await screen.findByText("Locally observed usage")).toBeTruthy();
+    expect(screen.getByText(/Synthetic demo data/i)).toBeTruthy();
   });
 });

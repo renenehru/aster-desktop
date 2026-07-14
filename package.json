@@ -1,9 +1,9 @@
 {
   "name": "aster-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "Apache-2.0",
-  "description": "A security-focused, local-first desktop client for the Z.AI chat API.",
+  "description": "A security-focused, local-first Windows desktop client for curated official AI provider APIs.",
   "homepage": "https://github.com/renenehru/aster-desktop#readme",
   "repository": {
     "type": "git",
@@ -32,16 +32,20 @@
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc -b --pretty false",
+    "security:build-identity": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-identity.fixtures.ps1",
+    "security:package-audit": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-audit.fixtures.ps1",
+    "security:package-provenance": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-provenance.fixtures.ps1",
+    "security:patterns": "node scripts/secret-patterns.fixtures.mjs",
     "security:secrets": "node scripts/secret-scan.mjs",
     "security:config": "node scripts/security-audit.mjs",
     "license:frontend": "node scripts/license-policy.mjs",
     "license:rust": "node scripts/rust-license-policy.mjs",
     "sbom:frontend": "node scripts/generate-sbom.mjs",
     "sbom:rust": "node scripts/generate-rust-sbom.mjs",
-    "check": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test:run && pnpm security:secrets && pnpm security:config && pnpm build",
+    "check": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test:run && pnpm security:build-identity && pnpm security:package-audit && pnpm security:package-provenance && pnpm security:patterns && pnpm security:secrets && pnpm security:config && pnpm build",
     "audit:frontend": "pnpm audit --audit-level high --prod",
     "audit:rust": "cargo audit --file src-tauri/Cargo.lock",
-    "verify": "pnpm check && pnpm audit:frontend && pnpm license:frontend && pnpm license:rust && pnpm sbom:frontend && pnpm sbom:rust"
+    "verify": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

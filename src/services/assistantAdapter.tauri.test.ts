@@ -9,13 +9,15 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: tauriMocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: tauriMocks.listen }));
 
 import { TauriAssistantAdapter } from "./assistantAdapter";
+import { DEMO_MODEL_CATALOG, DEMO_PROVIDER_STATUSES } from "./providerCatalog";
 import type { ChatStreamEvent } from "../types/chat";
 
 const rawConversation = {
   id: "conversation-1",
   title: "Contract chat",
-  model: "glm-5.1",
-  reasoningMode: "deep",
+  providerId: "zai",
+  modelId: "glm-5.1",
+  responseProfile: "deep",
   createdAt: "2026-07-11T10:00:00.000Z",
   updatedAt: "2026-07-11T10:01:00.000Z",
   messageCount: 1,
@@ -29,6 +31,24 @@ const rawConversation = {
       status: "complete",
     },
   ],
+};
+
+const rawUsageSummary = {
+  providerId: "zai",
+  modelId: null,
+  windowStart: "2026-07-06T12:00:00.000Z",
+  windowEnd: "2026-07-13T12:00:00.000Z",
+  observedAt: "2026-07-13T12:00:00.000Z",
+  usage: {
+    inputTokens: 10,
+    cachedInputTokens: 2,
+    outputTokens: 8,
+    totalTokens: 20,
+  },
+  completeObservations: 1,
+  partialObservations: 0,
+  coverage: "complete",
+  budget: null,
 };
 
 interface RawByteView {
@@ -72,12 +92,22 @@ describe("TauriAssistantAdapter IPC mapping", () => {
         online: false,
         databaseReady: true,
       })
-      .mockResolvedValueOnce({ configured: true, source: "windows-credential-manager" })
-      .mockResolvedValueOnce({ configured: true, cancelled: false })
-      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(DEMO_MODEL_CATALOG)
+      .mockResolvedValueOnce(
+        DEMO_PROVIDER_STATUSES.map((status) =>
+          status.providerId === "zai" ? { ...status, configured: true } : status,
+        ),
+      )
+      .mockResolvedValueOnce({ providerId: "zai", configured: true, cancelled: false })
+      .mockResolvedValueOnce({ providerId: "zai", configured: false })
       .mockResolvedValueOnce([rawConversation])
       .mockResolvedValueOnce(rawConversation)
       .mockResolvedValueOnce(rawConversation)
+      .mockResolvedValueOnce({
+        ...rawConversation,
+        providerId: "deepseek",
+        modelId: "deepseek-v4-pro",
+      })
       .mockResolvedValueOnce({ ...rawConversation, title: "Renamed" })
       .mockResolvedValueOnce(null);
 
@@ -85,31 +115,41 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       mode: "desktop",
       version: "0.1.0",
       online: false,
-      providerReachability: "unknown",
-      externalProcessingAcknowledged: false,
       databaseReady: true,
     });
-    await expect(adapter.credentialStatus()).resolves.toEqual({
-      configured: true,
-      source: "credential-vault",
-    });
-    await expect(adapter.promptStoreApiKey()).resolves.toMatchObject({
+    await expect(adapter.modelCatalog()).resolves.toEqual(DEMO_MODEL_CATALOG);
+    await expect(adapter.providerStatuses()).resolves.toHaveLength(5);
+    await expect(adapter.promptStoreApiKey("zai")).resolves.toMatchObject({
+      providerId: "zai",
       configured: true,
       cancelled: false,
     });
-    await expect(adapter.deleteApiKey()).resolves.toEqual({ configured: false, source: "none" });
+    await expect(adapter.deleteApiKey("zai")).resolves.toEqual({
+      providerId: "zai",
+      configured: false,
+      source: "none",
+    });
     await expect(adapter.listConversations()).resolves.toHaveLength(1);
     await expect(adapter.getConversation("conversation-1")).resolves.toMatchObject({
       id: "conversation-1",
       messages: [{ role: "user" }],
     });
     await adapter.createConversation("New title");
+    await adapter.updateConversationSelection("conversation-1", "deepseek", "deepseek-v4-pro");
     await adapter.renameConversation("conversation-1", "Renamed");
     await adapter.deleteConversation("conversation-1");
 
     expectRawInvocation("app_status", {});
-    expectRawInvocation("prompt_store_api_key", {});
+    expectRawInvocation("model_catalog", {});
+    expectRawInvocation("provider_statuses", {});
+    expectRawInvocation("prompt_store_api_key", { providerId: "zai" });
+    expectRawInvocation("delete_api_key", { providerId: "zai" });
     expectRawInvocation("create_conversation", { title: "New title" });
+    expectRawInvocation("update_conversation_selection", {
+      conversationId: "conversation-1",
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+    });
     expectRawInvocation("rename_conversation", {
       conversationId: "conversation-1",
       title: "Renamed",
@@ -138,13 +178,13 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       adapter.sendMessage({
         conversationId: "conversation-1",
         content: "Hello",
-        reasoningMode: "standard",
+        responseProfile: "standard",
         regenerateFromMessageId: "message-1",
       }),
     ).resolves.toEqual({ requestId: "request-1" });
     await adapter.cancelGeneration("request-1");
     await adapter.openExternalUrl("https://example.com/guide");
-    await adapter.acknowledgeExternalProcessing();
+    await adapter.acknowledgeExternalProcessing("zai");
     await expect(adapter.exportConversation("conversation-1")).resolves.toBe(
       '{"format":"aster-conversation"}',
     );
@@ -160,14 +200,14 @@ describe("TauriAssistantAdapter IPC mapping", () => {
     expectRawInvocation("send_message", {
       conversationId: "conversation-1",
       content: "Hello",
-      reasoningMode: "standard",
+      responseProfile: "standard",
       regenerateFromMessageId: "message-1",
     });
     expectRawInvocation("cancel_generation", { requestId: "request-1" });
     expectRawInvocation("open_external_url", {
       url: "https://example.com/guide",
     });
-    expectRawInvocation("acknowledge_external_processing", {});
+    expectRawInvocation("acknowledge_external_processing", { providerId: "zai" });
     expectRawInvocation("import_conversations", {});
     expect(
       tauriMocks.invoke.mock.calls.every((call) => call.length === 2 && isRawByteView(call[1])),
@@ -181,7 +221,7 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       adapter.sendMessage({
         conversationId: "conversation-1",
         content: "\u20ac".repeat(110 * 1_024),
-        reasoningMode: "standard",
+        responseProfile: "standard",
       }),
     ).rejects.toThrow("320 KiB");
     expect(tauriMocks.invoke).not.toHaveBeenCalled();
@@ -194,9 +234,105 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       adapter.sendMessage({
         conversationId: "conversation-1",
         content: "Hello",
-        reasoningMode: "fast",
+        responseProfile: "fast",
       }),
-    ).rejects.toThrow("did not return");
+    ).rejects.toThrow("invalid generation request ID");
+  });
+
+  it("rejects usage and budget responses that are crossed to another scope", async () => {
+    const adapter = new TauriAssistantAdapter();
+    tauriMocks.invoke
+      .mockResolvedValueOnce({ ...rawUsageSummary, providerId: "deepseek" })
+      .mockResolvedValueOnce({ ...rawUsageSummary, modelId: "glm-5.1" });
+
+    await expect(adapter.usageSummary("zai")).rejects.toThrow(/requested usage scope/i);
+    await expect(adapter.setUsageBudget("zai", 100_000)).rejects.toThrow(
+      /provider-wide budget scope/i,
+    );
+  });
+
+  it.each(["stop", "outputLimit", "unknown"] as const)(
+    "preserves the typed %s finish reason on completed desktop messages",
+    async (finishReason) => {
+      const adapter = new TauriAssistantAdapter();
+      tauriMocks.invoke.mockResolvedValueOnce({
+        ...rawConversation,
+        messages: [
+          {
+            ...rawConversation.messages[0],
+            role: "assistant",
+            finishReason,
+          },
+        ],
+      });
+
+      await expect(adapter.getConversation("conversation-1")).resolves.toMatchObject({
+        messages: [{ role: "assistant", status: "complete", finishReason }],
+      });
+    },
+  );
+
+  it.each(["cancelled", "error"] as const)(
+    "accepts an assistant %s message only when its finish reason is omitted",
+    async (status) => {
+      const adapter = new TauriAssistantAdapter();
+      tauriMocks.invoke.mockResolvedValueOnce({
+        ...rawConversation,
+        messages: [{ ...rawConversation.messages[0], role: "assistant", status }],
+      });
+
+      const conversation = await adapter.getConversation("conversation-1");
+      expect(conversation.messages[0]).toMatchObject({ role: "assistant", status });
+      expect(conversation.messages[0]).not.toHaveProperty("finishReason");
+    },
+  );
+
+  it.each([
+    [
+      "a completed assistant message without a finish reason",
+      { ...rawConversation.messages[0], role: "assistant" },
+      /finish reason/i,
+    ],
+    [
+      "an unknown finish reason",
+      { ...rawConversation.messages[0], role: "assistant", finishReason: "length" },
+      /finish reason/i,
+    ],
+    [
+      "a user message with a finish reason",
+      { ...rawConversation.messages[0], finishReason: "stop" },
+      /finish reason/i,
+    ],
+    [
+      "a cancelled user message",
+      { ...rawConversation.messages[0], status: "cancelled" },
+      /user message status/i,
+    ],
+    [
+      "a cancelled assistant message with a finish reason",
+      {
+        ...rawConversation.messages[0],
+        role: "assistant",
+        status: "cancelled",
+        finishReason: "stop",
+      },
+      /finish reason/i,
+    ],
+    [
+      "an error assistant message with a finish reason",
+      {
+        ...rawConversation.messages[0],
+        role: "assistant",
+        status: "error",
+        finishReason: "unknown",
+      },
+      /finish reason/i,
+    ],
+  ])("rejects %s", async (_label, message, expectedError) => {
+    const adapter = new TauriAssistantAdapter();
+    tauriMocks.invoke.mockResolvedValueOnce({ ...rawConversation, messages: [message] });
+
+    await expect(adapter.getConversation("conversation-1")).rejects.toThrow(expectedError);
   });
 
   it("normalizes valid stream events and ignores malformed events", async () => {
@@ -215,12 +351,15 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       payload: {
         requestId: "request-1",
         conversationId: "conversation-1",
+        providerId: "zai",
+        modelId: "glm-5.1",
         sequence: 1,
         kind: "completed",
         message: {
           ...rawConversation.messages[0],
           role: "assistant",
           status: "complete",
+          finishReason: "outputLimit",
         },
       },
     });
@@ -228,6 +367,8 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       payload: {
         requestId: "request-2",
         conversationId: "conversation-1",
+        providerId: "zai",
+        modelId: "glm-5.1",
         sequence: 0,
         kind: "unknown",
       },
@@ -237,6 +378,7 @@ describe("TauriAssistantAdapter IPC mapping", () => {
     expect(events[0]).toMatchObject({
       kind: "completed",
       requestId: "request-1",
+      message: { finishReason: "outputLimit" },
     });
     expect(events[1]).toMatchObject({
       kind: "error",
@@ -245,6 +387,55 @@ describe("TauriAssistantAdapter IPC mapping", () => {
     });
     stopListening();
     expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("rejects terminal stream messages with invalid state or finish-reason combinations", async () => {
+    const adapter = new TauriAssistantAdapter();
+    const events: ChatStreamEvent[] = [];
+    let deliver: ((event: { payload: unknown }) => void) | undefined;
+    tauriMocks.listen.mockImplementation(
+      (_name: string, callback: (event: { payload: unknown }) => void) => {
+        deliver = callback;
+        return Promise.resolve(() => undefined);
+      },
+    );
+    await adapter.onChatStream((event) => events.push(event));
+
+    const base = {
+      requestId: "request-terminal",
+      conversationId: "conversation-1",
+      providerId: "zai",
+      modelId: "glm-5.1",
+      sequence: 1,
+    };
+    const assistant = { ...rawConversation.messages[0], role: "assistant" };
+    for (const payload of [
+      { ...base, kind: "completed", message: assistant },
+      {
+        ...base,
+        kind: "completed",
+        message: { ...assistant, finishReason: "unknown" },
+      },
+      {
+        ...base,
+        kind: "cancelled",
+        message: { ...assistant, finishReason: "stop" },
+      },
+      {
+        ...base,
+        kind: "error",
+        message: { ...assistant, status: "error", finishReason: "stop" },
+        error: "Provider failed",
+        errorCode: "provider_error",
+        retryable: false,
+      },
+    ]) {
+      deliver?.({ payload });
+    }
+
+    expect(events).toHaveLength(4);
+    expect(events.every((event) => event.kind === "error")).toBe(true);
+    expect(events.every((event) => event.errorCode === "malformed_stream_event")).toBe(true);
   });
 
   it("terminalizes oversized and kind-incompatible stream payloads safely", async () => {
@@ -264,6 +455,8 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       payload: {
         requestId: "oversized",
         conversationId: "conversation-1",
+        providerId: "zai",
+        modelId: "glm-5.1",
         sequence: 1,
         kind: "delta",
         delta: "x".repeat(64 * 1_024 + 1),
@@ -271,8 +464,21 @@ describe("TauriAssistantAdapter IPC mapping", () => {
     });
     deliver?.({
       payload: {
+        requestId: "oversized-utf8",
+        conversationId: "conversation-1",
+        providerId: "zai",
+        modelId: "glm-5.1",
+        sequence: 1,
+        kind: "delta",
+        delta: "é".repeat(32 * 1_024 + 1),
+      },
+    });
+    deliver?.({
+      payload: {
         requestId: "wrong-fields",
         conversationId: "conversation-1",
+        providerId: "zai",
+        modelId: "glm-5.1",
         sequence: 0,
         kind: "started",
         delta: "not allowed",
@@ -282,6 +488,8 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       payload: {
         requestId: "bad-error",
         conversationId: "conversation-1",
+        providerId: "zai",
+        modelId: "glm-5.1",
         sequence: 2,
         kind: "error",
         error: "Provider failed",
@@ -298,7 +506,7 @@ describe("TauriAssistantAdapter IPC mapping", () => {
       },
     });
 
-    expect(events).toHaveLength(3);
+    expect(events).toHaveLength(4);
     expect(events.every((event) => event.errorCode === "malformed_stream_event")).toBe(true);
     expect(events.every((event) => event.retryable === true)).toBe(true);
     expect(unscopedError).toHaveBeenCalledOnce();
@@ -308,7 +516,7 @@ describe("TauriAssistantAdapter IPC mapping", () => {
     const adapter = new TauriAssistantAdapter();
     tauriMocks.invoke
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce({ configured: false })
+      .mockResolvedValueOnce([{ providerId: "not-real" }])
       .mockResolvedValueOnce([
         null,
         { title: 42, created_at: "bad-date", reasoning_mode: "unknown" },
@@ -316,13 +524,10 @@ describe("TauriAssistantAdapter IPC mapping", () => {
 
     await expect(adapter.appStatus()).resolves.toMatchObject({
       mode: "desktop",
-      online: true,
+      online: false,
       databaseReady: true,
     });
-    await expect(adapter.credentialStatus()).resolves.toEqual({
-      configured: false,
-      source: "none",
-    });
-    await expect(adapter.listConversations()).rejects.toThrow("reasoning mode");
+    await expect(adapter.providerStatuses()).rejects.toThrow("provider status");
+    await expect(adapter.listConversations()).rejects.toThrow("provider");
   });
 });

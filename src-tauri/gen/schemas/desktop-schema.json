@@ -369,10 +369,10 @@
           "markdownDescription": "Enables the create_conversation command without any pre-configured scope."
         },
         {
-          "description": "Enables the credential_status command without any pre-configured scope.",
+          "description": "Enables the deepseek_balance_status command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-credential-status",
-          "markdownDescription": "Enables the credential_status command without any pre-configured scope."
+          "const": "allow-deepseek-balance-status",
+          "markdownDescription": "Enables the deepseek_balance_status command without any pre-configured scope."
         },
         {
           "description": "Enables the delete_api_key command without any pre-configured scope.",
@@ -411,16 +411,40 @@
           "markdownDescription": "Enables the list_conversations command without any pre-configured scope."
         },
         {
+          "description": "Enables the model_catalog command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-model-catalog",
+          "markdownDescription": "Enables the model_catalog command without any pre-configured scope."
+        },
+        {
           "description": "Enables the open_external_url command without any pre-configured scope.",
           "type": "string",
           "const": "allow-open-external-url",
           "markdownDescription": "Enables the open_external_url command without any pre-configured scope."
         },
         {
+          "description": "Enables the open_provider_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-provider-account",
+          "markdownDescription": "Enables the open_provider_account command without any pre-configured scope."
+        },
+        {
           "description": "Enables the prompt_store_api_key command without any pre-configured scope.",
           "type": "string",
           "const": "allow-prompt-store-api-key",
           "markdownDescription": "Enables the prompt_store_api_key command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the provider_statuses command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-provider-statuses",
+          "markdownDescription": "Enables the provider_statuses command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the refresh_deepseek_balance command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-refresh-deepseek-balance",
+          "markdownDescription": "Enables the refresh_deepseek_balance command without any pre-configured scope."
         },
         {
           "description": "Enables the rename_conversation command without any pre-configured scope.",
@@ -433,6 +457,24 @@
           "type": "string",
           "const": "allow-send-message",
           "markdownDescription": "Enables the send_message command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_usage_budget command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-usage-budget",
+          "markdownDescription": "Enables the set_usage_budget command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_conversation_selection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-conversation-selection",
+          "markdownDescription": "Enables the update_conversation_selection command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the usage_summary command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-usage-summary",
+          "markdownDescription": "Enables the usage_summary command without any pre-configured scope."
         },
         {
           "description": "Denies the acknowledge_external_processing command without any pre-configured scope.",
@@ -459,10 +501,10 @@
           "markdownDescription": "Denies the create_conversation command without any pre-configured scope."
         },
         {
-          "description": "Denies the credential_status command without any pre-configured scope.",
+          "description": "Denies the deepseek_balance_status command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-credential-status",
-          "markdownDescription": "Denies the credential_status command without any pre-configured scope."
+          "const": "deny-deepseek-balance-status",
+          "markdownDescription": "Denies the deepseek_balance_status command without any pre-configured scope."
         },
         {
           "description": "Denies the delete_api_key command without any pre-configured scope.",
@@ -501,16 +543,40 @@
           "markdownDescription": "Denies the list_conversations command without any pre-configured scope."
         },
         {
+          "description": "Denies the model_catalog command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-model-catalog",
+          "markdownDescription": "Denies the model_catalog command without any pre-configured scope."
+        },
+        {
           "description": "Denies the open_external_url command without any pre-configured scope.",
           "type": "string",
           "const": "deny-open-external-url",
           "markdownDescription": "Denies the open_external_url command without any pre-configured scope."
         },
         {
+          "description": "Denies the open_provider_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-provider-account",
+          "markdownDescription": "Denies the open_provider_account command without any pre-configured scope."
+        },
+        {
           "description": "Denies the prompt_store_api_key command without any pre-configured scope.",
           "type": "string",
           "const": "deny-prompt-store-api-key",
           "markdownDescription": "Denies the prompt_store_api_key command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the provider_statuses command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-provider-statuses",
+          "markdownDescription": "Denies the provider_statuses command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the refresh_deepseek_balance command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-refresh-deepseek-balance",
+          "markdownDescription": "Denies the refresh_deepseek_balance command without any pre-configured scope."
         },
         {
           "description": "Denies the rename_conversation command without any pre-configured scope.",
@@ -523,6 +589,24 @@
           "type": "string",
           "const": "deny-send-message",
           "markdownDescription": "Denies the send_message command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_usage_budget command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-usage-budget",
+          "markdownDescription": "Denies the set_usage_budget command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_conversation_selection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-conversation-selection",
+          "markdownDescription": "Denies the update_conversation_selection command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the usage_summary command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-usage-summary",
+          "markdownDescription": "Denies the usage_summary command without any pre-configured scope."
         },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
