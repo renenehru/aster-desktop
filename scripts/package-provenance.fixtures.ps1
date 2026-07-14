@@ -18,6 +18,28 @@ if (-not $sandbox.StartsWith($temporaryPrefix, [StringComparison]::OrdinalIgnore
 }
 $fixtureJunctions = [System.Collections.Generic.List[string]]::new()
 
+$originalModulePath = $env:PSModulePath
+$fallbackModule = $null
+try {
+    $env:PSModulePath = Join-Path $temporaryRoot ("aster-empty-module-path-" + [guid]::NewGuid().ToString("N"))
+    $fallbackModule = Import-Module (Join-Path $PSScriptRoot "Aster.Packaging.psm1") -Force -PassThru
+    $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+    $observation = & $fallbackModule {
+        param($Root, $Artifact)
+        Get-AsterAuthenticodeObservation -RepositoryRoot $Root -Path $Artifact
+    } $repositoryRoot $PSCommandPath
+    if ($observation -cne "NOT RUN (verifier unavailable)") {
+        throw "The unavailable Authenticode verifier fixture did not return the canonical NOT RUN observation."
+    }
+}
+finally {
+    $env:PSModulePath = $originalModulePath
+    if ($null -ne $fallbackModule) {
+        Remove-Module $fallbackModule -Force
+    }
+    Import-Module $identityModule -Force
+}
+
 function Write-FixtureText {
     param([string]$Path, [string]$Content)
     $parent = [System.IO.Directory]::GetParent($Path).FullName
@@ -215,12 +237,28 @@ try {
         -RepositoryRoot $positive.Root `
         -Path (Join-Path $positiveOutput "verification-report.md") `
         -MaximumBytes 1048576
+    $positiveSourceLines = [regex]::Matches($positiveReport, '(?im)^\*\*Source revision:\*\*.*$').Count
+    $positiveVerifier = $positiveReport -match '(?m)^\*\*Self-declared verifier identity:\*\* fixture-reviewer$'
+    $positiveClassification = $positiveReport -match '(?m)^\*\*Overall classification:\*\* Unsigned engineering build for local evaluation$'
+    $positiveAuthenticodeHeader = $positiveReport -match '(?m)^\| File \| Bytes \| Modified UTC \| SHA-256 \| Authenticode observation \|\r?$'
+    $positiveAuthenticodeRows = [regex]::Matches(
+        $positiveReport,
+        '(?m)\| (?:NotSigned|UnknownError|NOT RUN \(verifier unavailable\)) \|\r?$'
+    ).Count
+    $positiveAuthenticodeScope = $positiveReport -match 'it is not signature\s+evidence and never satisfies the production signing gate'
+    $positiveExecutableRows = @(
+        [regex]::Matches($positiveReport, '(?m)^\| `[^`]+\.exe` \|.*\r?$') |
+            ForEach-Object { $_.Value.TrimEnd("`r") }
+    ) -join " || "
     if (
-        [regex]::Matches($positiveReport, '(?im)^\*\*Source revision:\*\*.*$').Count -ne 1 -or
-        $positiveReport -notmatch '(?m)^\*\*Self-declared verifier identity:\*\* fixture-reviewer$' -or
-        $positiveReport -notmatch '(?m)^\*\*Overall classification:\*\* Unsigned engineering build for local evaluation$'
+        $positiveSourceLines -ne 1 -or
+        -not $positiveVerifier -or
+        -not $positiveClassification -or
+        -not $positiveAuthenticodeHeader -or
+        $positiveAuthenticodeRows -ne 2 -or
+        -not $positiveAuthenticodeScope
     ) {
-        throw "The positive package report did not preserve its source, self-declared verifier, and unsigned engineering classification."
+        throw "The positive package report failed its bounded identity assertions (source=$positiveSourceLines; verifier=$positiveVerifier; classification=$positiveClassification; AuthenticodeHeader=$positiveAuthenticodeHeader; AuthenticodeRows=$positiveAuthenticodeRows; AuthenticodeScope=$positiveAuthenticodeScope; executableRows=$positiveExecutableRows)."
     }
     Import-Module $positive.PackageModule -Force
     $positiveInventoryText = Read-AsterStrictUtf8Text `

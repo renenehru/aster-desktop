@@ -234,7 +234,14 @@ assert(
 assert(
   buildIdentityModule.includes("[System.Security.Cryptography.SHA256]::Create()") &&
     !buildIdentityModule.includes("Get-FileHash") &&
-    !packagingModule.includes("Get-FileHash"),
+    !packagingModule.includes("Get-FileHash") &&
+    packagingModule.includes('return "NOT RUN (verifier unavailable)"') &&
+    packagingModule.includes('$securityModule.ExportedCommands["Get-AuthenticodeSignature"]') &&
+    packagingModule.includes("The Authenticode verifier contract is invalid.") &&
+    packagingModule.includes("The Authenticode verifier returned an invalid status.") &&
+    packagingModule.includes("it is not signature") &&
+    packageProvenanceFixtures.includes("The unavailable Authenticode verifier fixture") &&
+    packageProvenanceFixtures.includes('"NOT RUN (verifier unavailable)"'),
   "Build and packaging identity must not depend on the optional Get-FileHash cmdlet.",
 );
 assert(

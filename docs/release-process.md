@@ -247,17 +247,21 @@ collected and packaged. Record that gate according to the actual evidence; a
 required `NOT RUN` blocks public binary distribution but does not block source
 publication under Apache-2.0.
 
-Verify copied `0.2.0` artifacts against the checksum file:
+Verify copied `0.2.0` artifacts against the checksum file. The project helper
+does not depend on the optional `Get-FileHash` cmdlet:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 outputs\Aster-0.2.0-x64-engineering.exe
+Import-Module .\scripts\Aster.BuildIdentity.psm1 -Force
+Get-AsterFileIdentity -RepositoryRoot . -Path outputs\Aster-0.2.0-x64-engineering.exe
 Get-AuthenticodeSignature outputs\Aster-0.2.0-x64-engineering.exe
 Get-AuthenticodeSignature outputs\Aster-0.2.0-x64-engineering-setup.exe
 ```
 
 An observed `NotSigned` status is expected from the unsigned engineering
-workflow. The inspection procedure may pass while the production signing gate
-remains `NOT RUN`.
+workflow. If `Microsoft.PowerShell.Security` cannot be loaded, record the
+signature procedure as `NOT RUN (verifier unavailable)`; do not treat it as
+signature evidence. The checksum/inspection procedure may pass while the
+production signing gate remains `NOT RUN`.
 
 ## 8. Production promotion boundary
 
