@@ -344,14 +344,28 @@ function Get-AsterFileIdentity {
     if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
         throw "Build identity input is missing: $absolute"
     }
-    $item = Get-Item -LiteralPath $absolute -Force
     $rootPrefix = $root + [System.IO.Path]::DirectorySeparatorChar
     $relative = $absolute.Substring($rootPrefix.Length).Replace("\", "/")
-    $hash = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [System.IO.FileStream]::new(
+        $absolute,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $length = [long]$stream.Length
+        $digest = $algorithm.ComputeHash($stream)
+    }
+    finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+    $hash = ([System.BitConverter]::ToString($digest) -replace "-", "").ToLowerInvariant()
     [void](Resolve-AsterContainedPath -RepositoryRoot $root -Path $absolute)
     return [ordered]@{
         path   = $relative
-        bytes  = [long]$item.Length
+        bytes  = $length
         sha256 = $hash
     }
 }

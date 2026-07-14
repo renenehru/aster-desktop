@@ -761,7 +761,7 @@ function Write-AsterChecksums {
     $lineByName = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($file in $files) {
         $name = [System.IO.Path]::GetFileName($file)
-        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = (Get-AsterFileIdentity -RepositoryRoot $RepositoryRoot -Path $file).sha256
         [void](Resolve-AsterContainedPath -RepositoryRoot $RepositoryRoot -Path $file)
         $lineByName.Add($name, "$hash  $name")
     }
@@ -791,7 +791,10 @@ function Assert-AsterChecksums {
     foreach ($file in @(Get-AsterSafeDirectoryFiles -RepositoryRoot $RepositoryRoot -Path $Directory)) {
         $name = [System.IO.Path]::GetFileName($file)
         if ($name -cne "SHA256SUMS.txt") {
-            $expectedByName.Add($name, (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant())
+            $expectedByName.Add(
+                $name,
+                (Get-AsterFileIdentity -RepositoryRoot $RepositoryRoot -Path $file).sha256
+            )
             [void](Resolve-AsterContainedPath -RepositoryRoot $RepositoryRoot -Path $file)
         }
     }
@@ -1089,7 +1092,7 @@ function Invoke-AsterEngineeringPackage {
         $identityRows = foreach ($path in $identityTargets) {
             $safePath = Resolve-AsterContainedPath -RepositoryRoot $root -Path $path
             $item = Get-Item -LiteralPath $safePath -Force
-            $hash = (Get-FileHash -LiteralPath $safePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $hash = (Get-AsterFileIdentity -RepositoryRoot $root -Path $safePath).sha256
             [void](Resolve-AsterContainedPath -RepositoryRoot $root -Path $safePath)
             $signature = if ($item.Extension -eq ".exe") {
                 (Get-AuthenticodeSignature -LiteralPath $safePath).Status.ToString()

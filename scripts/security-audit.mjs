@@ -232,6 +232,12 @@ assert(
   "Local and CI gates must scan UTF-16LE/BE binary secrets at both byte alignments.",
 );
 assert(
+  buildIdentityModule.includes("[System.Security.Cryptography.SHA256]::Create()") &&
+    !buildIdentityModule.includes("Get-FileHash") &&
+    !packagingModule.includes("Get-FileHash"),
+  "Build and packaging identity must not depend on the optional Get-FileHash cmdlet.",
+);
+assert(
   packageManifest.scripts?.["security:package-provenance"] ===
     "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-provenance.fixtures.ps1" &&
     packageManifest.scripts?.check?.includes("pnpm security:package-provenance") &&
