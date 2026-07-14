@@ -95,15 +95,19 @@ remote scripts to diagnose a blank window.
 ## The application says `Demo mode`
 
 This is expected after `pnpm dev`. The browser adapter is in-memory and cannot
-configure an API key, call Z.AI, use SQLite, or exercise native dialogs. Start
+configure a provider key, call Z.AI, DeepSeek, Alibaba Cloud, Google, or NVIDIA,
+refresh a balance, open an account-management page, use SQLite, or exercise
+native dialogs. Its catalog and Usage data are deterministic UI fixtures. Start
 `pnpm desktop:dev` when native behavior is required.
 
 ## There is no API-key field in the interface
 
 This is intentional. The webview must never render or transport an API key.
-Start the desktop app, open **Settings**, and use **Add API key** to invoke the
-Rust-owned native Windows prompt. Cancelling the prompt preserves the previous
-credential status.
+Start the desktop app, open **Settings**, choose the intended provider, and use
+its **Add API key** action to invoke the Rust-owned native Windows prompt.
+Cancelling the prompt preserves that provider's previous credential status.
+Every provider has a separate Windows Credential Manager target; adding or
+removing one key must not change another provider's status.
 
 Never add a temporary HTML password input, IPC key argument, environment-file
 key, browser-storage key, or logging statement as a diagnostic workaround.
@@ -112,17 +116,67 @@ key, browser-storage key, or logging statement as a diagnostic workaround.
 
 Check the visible state without inspecting sensitive payloads:
 
-1. Confirm the desktop credential status is configured.
-2. Review and acknowledge the external-processing notice for the current app
-   session; the acknowledgement intentionally does not persist across launches.
-3. Check normal network reachability to the documented provider without changing
+1. Confirm that the conversation is bound to the intended provider and exact
+   catalog model.
+2. Confirm the credential status for that provider. A key configured for another
+   provider does not satisfy this check.
+3. Review and acknowledge the selected provider's current external-processing
+   notice. For Alibaba Cloud, confirm the fixed US-region disclosure.
+4. Check normal network reachability to the documented provider without changing
    the fixed origin or bypassing certificate validation.
-4. Use the stable UI error code and retry guidance. Authentication failures are
+5. Use the stable UI error code and retry guidance. Authentication failures are
    not automatically retried; replace or remove the credential through Settings.
 
-Startup provider reachability is intentionally `unknown` until a real attempt
-completes. Do not interpret that state as evidence that the provider is online or
-offline.
+Aster performs no automatic provider retry. Selecting retry, resend, or
+regenerate is a new explicit operation and may consume additional tokens.
+
+Startup reachability for each provider is intentionally `unknown` until a real
+attempt completes. Do not interpret that state as evidence that a provider or
+model is online, offline, available, or compatible.
+
+## The provider or model cannot be changed in the current chat
+
+This is intentional after the first message is persisted. Provider and model are
+fixed for that conversation so edit, resend, regenerate, events, credentials,
+and Usage cannot cross boundaries. Choose **Start a new chat with this model**
+and confirm the action. Aster does not copy the old conversation context into the
+new provider request.
+
+An empty conversation should allow a pair from the closed catalog. If a verified
+pair is missing or an unexpected entry appears, capture only the safe IDs and
+source revision, run the frontend catalog snapshot
+`pnpm test:run -- src/services/providerCatalog.test.ts`, the Rust catalog tests
+`cargo test --manifest-path src-tauri/Cargo.toml --workspace catalog`, and
+`pnpm security:config` for the surrounding capability/origin boundary. Report
+catalog drift; do not add a free-form model, endpoint, or unavailable
+placeholder as a workaround.
+
+## Usage appears partial or differs from a provider bill
+
+Aster Usage is a local advisory total for the trailing seven days, not provider
+billing or credit. It uses only validated usage metadata returned for Aster
+operations. A cancelled or failed attempt, missing provider fields, historical
+v1 total, or operation outside Aster may make the breakdown partial or different
+from the provider website.
+
+The configured weekly token budget is also local. It does not stop a request or
+represent purchased credit. When 10% or less remains, the UI should show a red
+warning plus explicit text and an icon. If the threshold appears wrong, report
+the provider ID, model ID, safe aggregate counts, configured budget, UTC time,
+and source revision; do not include conversation text or raw provider data.
+
+## Balance refresh or account management fails
+
+Only DeepSeek has an MVP v2 balance refresh, and it runs only after an explicit
+user action. The value is held for the current session and is not stored. Other
+providers direct the user to their official website; they do not have an Aster
+balance value.
+
+Usage, billing, add-credit, spend, and deployment actions open fixed official
+pages in the operating system's default browser. Aster never buys credit or
+changes a plan. If nothing opens, verify the Windows default-browser association
+and the stable error code. Do not paste an account URL into the renderer, broaden
+Tauri shell permissions, or embed an account page to bypass the fixed action map.
 
 ## A conversation, database, or migration error occurs
 
@@ -131,6 +185,10 @@ conversations in user-scoped plaintext SQLite and is designed to fail safely on
 corruption or migration failure.
 
 - Preserve the original data file and capture only the safe error code.
+- A v1-to-v2 upgrade must retain existing conversations as `zai` / `glm-5.1`
+  and preserve each historical total only on its message, with the breakdown
+  left unknown. It must not seed the v2 usage ledger. Do not edit provider/model
+  columns manually.
 - If the UI remains usable, make an explicit export and treat the JSON as
   sensitive plaintext.
 - Reproduce with a temporary test database or isolated Windows profile rather
@@ -144,9 +202,12 @@ paths containing a user identity to a public issue.
 ## Import is rejected
 
 Import uses a strict, versioned schema and validates the complete document before
-starting a transaction. Confirm the file matches the version 1 schema in
-`src-tauri/IPC_CONTRACT.md`, uses `model: "glm-5.1"`, contains only allowed
-fields/enums, observes count/size/depth limits, and has valid RFC 3339 timestamps.
+starting a transaction. Confirm the file matches the version 2 schema in
+`src-tauri/IPC_CONTRACT.md`, contains a registered provider/model pair, contains
+only allowed fields/enums, observes count/size/depth limits, and has valid RFC
+3339 timestamps. A legacy version 1 Aster export is accepted only through its
+documented migration path as `zai` / `glm-5.1`; its old token value remains a
+total with an incomplete breakdown.
 
 Do not loosen validation to accept source IDs, filesystem paths, HTML execution
 state, credentials, headers, tool messages, unknown fields, or unsupported
@@ -222,19 +283,31 @@ path.
 `scripts/package-engineering.ps1` requires:
 
 - Git, an identified `HEAD`, and a completely clean working tree;
-- a repository-relative evidence record tracked by that revision;
+- `work/build-identity.json` generated from the same clean revision;
+- an ignored evidence draft named
+  `work/evidence/YYYY-MM-DD-<full-revision>-engineering-build.md` that declares the
+  full build revision;
 - the release executable and NSIS installer;
 - both SBOMs under `work/`;
 - the selected evidence record;
-- `outputs/Aster-MVP-v1-preview.png`;
+- tracked `assets/Aster-MVP-v2-preview.png` as the non-sensitive preview input;
 - the production `dist/` bundle.
 
-Run full verification to generate SBOMs, run the engineering build, create and
-commit the revision-specific evidence record, and provide the non-sensitive
-preview before retrying. Commit or remove every source change, then pass the
-current repository-relative evidence path with `-EvidenceRecord`. The script
-uses `git archive` so ignored and untracked workspace data cannot enter the
-source handoff.
+Commit the source revision first, run full verification to generate SBOMs, run
+the engineering build to generate its identity, create the ignored
+revision-specific evidence draft, and provide the non-sensitive preview before
+retrying. Do not commit the draft before packaging; that would change `HEAD`.
+Move any unexpected file or subdirectory out of `outputs/`; the packager rejects
+it instead of silently including it. Pass the `work/evidence/` path with
+`-EvidenceRecord` and a bounded self-declared reviewer or CI job label with
+`-VerifierIdentity`. That label is self-declared and is not an authenticated
+identity. The script recomputes the recorded hashes and uses
+`git archive` only for the matched clean revision, so stale artifacts and
+ignored/untracked workspace data cannot enter the supported handoff silently.
+
+For an MVP v2 handoff, confirm every manifest, audit default, package path, and
+output name uses `0.2.0`. A mismatch is a packaging failure, not a reason to
+rename an artifact after the build.
 
 ## Authenticode reports `NotSigned`
 
@@ -246,7 +319,7 @@ authorized signing identity and retained positive and negative tamper evidence.
 
 ## There are no application log files
 
-This is intentional under `ADR-0009`. Aster MVP v1 creates no application
+This is intentional under `ADR-0009`. Aster MVP v2 creates no application
 diagnostic log, crash-report upload, telemetry, or analytics. Diagnose with
 deterministic tests, safe machine error codes, controlled fixtures, and
 non-sensitive environment metadata. Adding diagnostics is a separate privacy,

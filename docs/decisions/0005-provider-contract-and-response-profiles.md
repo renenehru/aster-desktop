@@ -1,6 +1,6 @@
 # ADR-0005: Pin the Verified `glm-5.1` Contract and Use Honest Application Response Profiles
 
-**Status:** Accepted
+**Status:** Superseded for MVP v2 by `ADR-0011`; retained as the MVP v1 `glm-5.1` decision
 
 **Date:** 2026-07-12
 

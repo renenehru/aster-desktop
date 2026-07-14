@@ -138,7 +138,7 @@ Prefer squash merge for a noisy branch or a normal merge when preserving a delib
 
 Community contributors should fork the public repository and submit pull requests without direct write access. Invite only trusted maintainers by their exact GitHub username and grant **Write** access rather than **Admin** access. Ask maintainers to enable two-factor authentication and protect their GitHub account. Review access periodically and remove accounts that no longer need it.
 
-Do not share one GitHub account, personal access token, SSH private key, signing key, or Z.AI API key among collaborators. Each contributor uses their own identity and local credential store.
+Do not share one GitHub account, personal access token, SSH private key, signing key, or provider API key among collaborators. Each contributor uses their own identity and local credential store.
 
 ## Source archives
 
@@ -146,10 +146,14 @@ GitHub clones and pull requests are the normal source-distribution mechanism. Wh
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package-engineering.ps1 `
-  -EvidenceRecord "docs\evidence\YYYY-MM-DD-<revision>-engineering-build.md"
+  -EvidenceRecord "work\evidence\YYYY-MM-DD-<full-revision>-engineering-build.md" `
+  -VerifierIdentity "self-declared-reviewer-or-ci-job"
 ```
 
-The script uses `git archive` on `HEAD`; ignored and untracked workspace files are excluded by construction, while the tracked Apache-2.0 `LICENSE` and attribution `NOTICE` are included. Do not zip the working directory or upload the existing `outputs/` source snapshot to GitHub.
+`VerifierIdentity` is a self-declared evidence label for local accountability;
+it is not an authenticated or cryptographically verified identity.
+
+The script first verifies that the executable, installer, SBOMs, and production frontend tree match the clean `HEAD` recorded by `work/build-identity.json`, then uses `git archive` on that revision. Ignored and untracked workspace files are excluded by construction, while the tracked Apache-2.0 `LICENSE` and attribution `NOTICE` are included. Do not zip the working directory or upload an existing `outputs/` snapshot without rerunning these checks.
 
 ## Recovery rules
 

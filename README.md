@@ -5,104 +5,172 @@
 <h1 align="center">Aster Desktop</h1>
 
 <p align="center">
-  A security-focused, local-first Windows 11 client for direct conversations with the official Z.AI chat API.
+  A security-focused, local-first Windows 11 chat client for a curated catalog of official AI provider APIs.
 </p>
 
-Aster combines a native Tauri shell, a React and TypeScript interface, a Rust trust boundary, Windows Credential Manager, and local SQLite conversation history.
+Aster combines a Tauri desktop shell, React and TypeScript presentation layer,
+Rust trust boundary, provider-scoped Windows credentials, and local SQLite
+conversation history. The renderer never receives an API key or chooses a
+network endpoint.
 
-> **Project status:** `v0.1.0` is an unsigned MVP v1 engineering implementation for local evaluation. It is not a signed production release, and the complete clean-profile Windows acceptance campaign remains outstanding. Revision-specific results must follow the [evidence policy](docs/evidence/README.md) and report exact `PASS`, `FAIL`, and `NOT RUN` outcomes.
+> **Project status:** `v0.2.0` specifies the MVP v2 multi-provider engineering
+> implementation. Current artifacts are unsigned engineering builds for local
+> evaluation, not signed production releases. Live-provider compatibility,
+> clean-profile Windows acceptance, package inventory, and signing must be
+> reported only through revision-specific evidence with exact `PASS`, `FAIL`,
+> and `NOT RUN` outcomes.
 
-## MVP v1 preview
+## Interface preview
 
 <p align="center">
-  <img src="assets/Aster-MVP-v1-preview.png" alt="Aster Desktop MVP v1 browser demo showing the new-conversation screen" width="1200" />
+  <img src="assets/Aster-MVP-v2-preview.png" alt="Aster Desktop MVP v2 browser demo showing the curated model selector" width="1200" />
 </p>
 
 <p align="center">
-  <em>Aster Desktop MVP v1 browser demo. This preview demonstrates the interface only; it is not evidence of native Windows, provider, persistence, credential-storage, packaging, or signing behavior.</em>
+  <em>Current MVP v2 browser-demo preview of the closed 17-model catalog. It is visual evidence only and does not establish native Windows behavior, provider networking, persistence, credential storage, packaging, or signing.</em>
 </p>
 
-## Highlights
+## MVP v2 highlights
 
-- Streamed `glm-5.1` responses with ordered deltas and real Rust-side cancellation.
-- Local conversation creation, search, rename, deletion, edit/resend, and regeneration.
-- Rust-owned native API-key capture; the credential value never enters the React webview or application IPC.
-- User-scoped SQLite history with transactional repository behavior.
-- Safe Markdown and code rendering without an application HTML sink.
-- Versioned, bounded conversation import and plaintext JSON export through native dialogs.
-- Three honest application response profiles: Fast, Standard, and Deep.
-- Restrictive Content Security Policy, explicit Tauri commands, and least-privilege capabilities.
-- Specification, threat model, architecture decisions, acceptance criteria, CI, dependency audits, and CycloneDX SBOM generation.
+- Closed Rust-owned catalog of 5 providers and 17 exact model identifiers.
+- Direct provider requests from Rust; React cannot perform provider networking.
+- Separate Rust-owned native credential prompt and Windows Credential Manager
+  target for each provider.
+- Provider and model fixed after the first message in a conversation; changing
+  either starts a new chat.
+- Fast, Standard, and Deep response profiles mapped only where the dated
+  provider contract verifies the exact model behavior.
+- Local seven-day token Usage view with input, cached input, output, and total
+  accounting, coverage disclosure, and an optional per-provider advisory budget.
+- Accessible red warning with text and icon when configured budget remaining is
+  at or below 10%.
+- Explicit, read-only DeepSeek balance refresh; balances are not stored.
+- Fixed provider account actions opened in the operating system's default
+  browser. Aster does not buy credits or change plans.
+- Local conversation lifecycle, safe Markdown, cancellation, edit/regenerate,
+  bounded import, and plaintext export through native dialogs.
+- Restrictive CSP and Tauri capabilities, security tests, dependency audits,
+  license policy checks, and CycloneDX SBOM generation.
 
-## MVP boundary
+## Verified catalog
 
-| Included in MVP v1          | Intentionally deferred               |
-| --------------------------- | ------------------------------------ |
-| Direct Z.AI chat            | Projects and workspaces              |
-| Streaming and stop          | File/document attachments            |
-| Local conversation history  | Shell or arbitrary command execution |
-| Edit and regenerate         | Model-invoked tools                  |
-| Safe Markdown and code copy | RAG and vector search                |
-| Native credential setup     | Voice input/output                   |
-| Import and export           | Automatic updates                    |
+Only the provider/model pairs below are included. The catalog has no custom
+endpoint, model discovery, or arbitrary model field. Exact contracts and dated
+official sources are recorded in
+[docs/provider-contract.md](docs/provider-contract.md).
 
-Deferred entries are disabled or labelled unavailable. No hidden backend capability is provided for them.
+| Provider           | Exact model identifiers                                                                         | Delivery boundary                 |
+| ------------------ | ----------------------------------------------------------------------------------------------- | --------------------------------- |
+| Z.AI               | `glm-4.7`, `glm-5`, `glm-5.1`, `glm-5.2`                                                        | Official Z.AI API                 |
+| DeepSeek           | `deepseek-v4-flash`, `deepseek-v4-pro`                                                          | Official DeepSeek API             |
+| Alibaba Cloud (US) | `qwen3.5-plus`, `qwen3.5-flash`, `qwen3.6-plus`, `qwen3.6-flash`, `qwen3.7-plus`, `qwen3.7-max` | Fixed US-region Alibaba Cloud API |
+| Google Gemini      | `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.5-pro`                                   | Official Gemini API               |
+| NVIDIA             | `nvidia/nemotron-3-super-120b-a12b`, `nvidia/nemotron-3-ultra-550b-a55b`                        | NVIDIA-hosted prototype endpoints |
+
+Alibaba content crosses a fixed US-region boundary, which Aster discloses before
+the first send. NVIDIA entries are hosted prototypes for evaluation and must not
+be described as production deployments.
+
+## Product boundary
+
+| Included in MVP v2                      | Outside MVP v2                           |
+| --------------------------------------- | ---------------------------------------- |
+| Curated direct multi-provider chat      | User-defined providers or endpoints      |
+| Streaming and explicit cancellation     | Automatic provider request retries       |
+| Local conversations and token Usage     | Provider billing or purchase automation  |
+| Native provider-scoped credential setup | Browser, environment, or IPC key entry   |
+| Explicit DeepSeek balance refresh       | Balance polling for other providers      |
+| Safe Markdown and code copy             | Model-invoked tools or shell execution   |
+| Bounded native-dialog import/export     | Attachments, RAG, and unrestricted files |
+| Browser-demo UI workflow                | Desktop/security evidence from the demo  |
+
+The interface does not list unverified model names. No hidden backend capability
+is provided for deferred features.
 
 ## Security architecture
 
 ```text
 React webview
-    │ typed, bounded Tauri commands and ordered events
-    ▼
+    | typed, bounded Tauri commands and ordered events; no secrets or URLs
+    v
 Rust application boundary
-    ├── Windows Credential Manager (API key)
-    ├── SQLite (local conversations)
-    ├── native import/export dialogs
-    └── fixed HTTPS origin → Z.AI chat API
+    +-- provider catalog and model/profile validation
+    +-- provider-scoped Windows Credential Manager targets
+    +-- SQLite conversations and advisory usage ledger
+    +-- native import/export dialogs
+    +-- fixed account actions -> operating-system default browser
+    +-- exact HTTPS adapters -> official provider-hosted APIs
 ```
 
 Core guarantees:
 
-- React cannot call Z.AI directly and never receives the API key.
-- Rust validates application IPC, imported data, persistence transitions, external links, provider streams, and cancellation.
-- Provider traffic uses the fixed documented HTTPS origin with normal platform certificate validation.
-- Raw HTML, remote active content, wildcard Tauri permissions, shell access, and arbitrary filesystem access are prohibited.
-- Browser demo mode is visibly isolated, credential-free, in-memory, and unsuitable as desktop security evidence.
+- React cannot call an AI provider and never receives a provider API key.
+- Rust validates IPC, provider/model/profile combinations, persistence
+  transitions, imported data, provider streams, usage metadata, and cancellation.
+- Credentials, origins, request mappings, and account URLs are selected from
+  fixed Rust-owned policy; no renderer or imported value can override them.
+- Normal platform TLS validation is mandatory. Raw HTML, remote active content,
+  wildcard permissions, shell access, and arbitrary filesystem access are
+  prohibited.
+- Provider requests receive no automatic retry. A retry is a new explicit user
+  operation because the earlier attempt may already have consumed tokens.
+- Browser demo mode is visibly isolated, credential-free, in-memory, and
+  unsuitable as native or security evidence.
 
-Read [AGENTS.md](AGENTS.md), the [architecture](docs/architecture.md), and the [security requirements](docs/security-requirements.md) before changing a trust boundary.
+Read [AGENTS.md](AGENTS.md), the
+[architecture](docs/architecture.md), and the
+[security requirements](docs/security-requirements.md) before changing a trust
+boundary.
 
-## Response profiles
+## Response profiles and conversation lock
 
-| Profile  | Provider thinking | Output-token cap | Intended use                           |
-| -------- | ----------------- | ---------------: | -------------------------------------- |
-| Fast     | Disabled          |            4,096 | Short, direct answers                  |
-| Standard | Enabled           |            8,192 | General-purpose conversations          |
-| Deep     | Enabled           |           16,384 | Longer responses with more output room |
+Fast, Standard, and Deep are Aster-owned profiles, not universal reasoning
+levels. Rust applies the model-specific request mapping and output-token cap
+recorded in the verified provider contract. A profile is disabled when its exact
+mapping is unsupported; Aster does not silently drop a field or substitute a
+model.
 
-Standard and Deep are application profiles, not different provider reasoning-effort levels. The accepted provider contract is pinned to `glm-5.1`; changing models requires a specification, privacy, architecture, threat-model, and contract-test update.
+An empty conversation may change its provider/model selection. After its first
+message is persisted, that pair is immutable for send, edit, resend,
+regenerate, credentials, usage, and stream events. Selecting another pair starts
+a new conversation so context never crosses provider boundaries silently.
+
+## Usage and provider accounts
+
+Usage is a local advisory view over the trailing seven days. Validated provider
+metadata is normalized as non-cached input, cached input, output, and total
+tokens. Missing metadata remains visibly partial. An optional weekly token
+budget is stored per provider; it does not block requests and is not a billing
+or credit value. At 10% remaining or below, Aster displays a red warning plus
+explicit status text and an icon.
+
+DeepSeek is the only MVP v2 provider with an explicit read-only balance refresh.
+The response is held only for the current application session. For usage,
+billing, credit, spending, or deployment management, Aster passes a typed
+provider/action pair to Rust. Rust selects a fixed official HTTPS page and opens
+it in the default browser. Aster never embeds account pages, purchases credits,
+or changes a plan.
 
 ## Prerequisites
 
 - Windows 11 x64 with Microsoft Edge WebView2 Runtime.
 - Node.js 22.12 or newer.
-- pnpm 10 or newer; the repository declares pnpm 11.7.0.
-- Rust 1.97.0 with the `x86_64-pc-windows-msvc` target.
-- Microsoft Visual Studio 2022 Build Tools with the Desktop development with C++ workload.
+- pnpm 10 or newer; `package.json` declares pnpm 11.7.0.
+- Rust 1.97.0 with `rustfmt`, Clippy, and the
+  `x86_64-pc-windows-msvc` target.
+- Microsoft Visual Studio 2022 Build Tools with the **Desktop development with
+  C++** workload.
 
-See the [development guide](docs/development.md) for fresh-laptop setup and tool verification.
+See the [development guide](docs/development.md) for a fresh-laptop setup and
+tool verification.
 
 ## Quick start
 
-Clone the repository:
+Clone the repository on each development laptop:
 
 ```powershell
 git clone https://github.com/renenehru/aster-desktop.git
 Set-Location aster-desktop
-```
-
-Install the exact locked dependencies:
-
-```powershell
 pnpm install --frozen-lockfile
 ```
 
@@ -118,11 +186,19 @@ Run the Windows desktop application:
 pnpm desktop:dev
 ```
 
-In the desktop app, open **Settings**, select **Add API key**, and complete the Rust-owned native Windows prompt. Review the external-processing disclosure before sending content to Z.AI.
+In the desktop app, open **Settings**, choose a provider, and use its **Add API
+key** action. Enter the key only in the Rust-owned native Windows prompt. Review
+the provider-specific external-processing disclosure before sending content.
+
+Existing MVP v1 databases migrate transactionally to schema v2. Historical
+conversations retain `zai` / `glm-5.1`; legacy total-token values remain totals
+with an incomplete breakdown. Back up valuable data before testing a migration,
+and never delete a database to conceal a migration failure.
 
 ## Verification
 
-Run the complete local verification orchestrator from a Visual Studio developer environment:
+Run the complete local verification orchestrator from a Visual Studio developer
+environment:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
@@ -139,9 +215,13 @@ pnpm security:secrets
 pnpm security:config
 ```
 
-The scope of each command is documented in [docs/testing.md](docs/testing.md). A passing unit test, browser preview, or screenshot must not be promoted into evidence for Windows credential storage, native IPC, packaged persistence, provider TLS, installer behavior, or signing.
+The scope of each command is documented in
+[docs/testing.md](docs/testing.md). A passing unit test, browser preview, or
+screenshot cannot be promoted into evidence for Windows credential storage,
+native IPC, packaged SQLite migration, provider TLS, installer behavior, live
+provider compatibility, or signing.
 
-## Build
+## Build classification
 
 Create an unsigned Windows engineering build:
 
@@ -150,7 +230,10 @@ powershell -ExecutionPolicy Bypass -File scripts/build-engineering.ps1
 powershell -ExecutionPolicy Bypass -File scripts/package-audit.ps1
 ```
 
-The build script remaps local Rust and native dependency paths before producing the Tauri executable and NSIS bundle. Unsigned artifacts are engineering outputs only. The [release process](docs/release-process.md) defines the additional evidence and signing requirements for production.
+Unsigned artifacts are engineering outputs for local evaluation only. The
+[release process](docs/release-process.md) defines revision identity, evidence,
+package review, Windows acceptance, and Authenticode requirements for a signed
+production release. Source publication on GitHub is not binary release approval.
 
 ## Documentation
 
@@ -162,7 +245,7 @@ Start with the [documentation index](docs/README.md).
 | Architecture      | [Architecture and trust boundaries](docs/architecture.md)                                         |
 | Security          | [Security requirements](docs/security-requirements.md) and [threat model](docs/threat-model.md)   |
 | Verification      | [Acceptance criteria](docs/acceptance-criteria.md) and [evidence policy](docs/evidence/README.md) |
-| External API      | [Verified provider contract](docs/provider-contract.md)                                           |
+| Provider APIs     | [Verified provider contract](docs/provider-contract.md)                                           |
 | Decisions         | [Architecture decision records](docs/decisions/README.md)                                         |
 | Contributor setup | [Development guide](docs/development.md)                                                          |
 | GitHub teamwork   | [Collaboration workflow](docs/collaboration-workflow.md)                                          |
@@ -171,20 +254,40 @@ Start with the [documentation index](docs/README.md).
 | Support           | [Troubleshooting](docs/troubleshooting.md) and [support policy](SUPPORT.md)                       |
 | Future work       | [Roadmap](docs/roadmap.md)                                                                        |
 
-## Collaboration
+## Collaboration across laptops
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md), [GOVERNANCE.md](GOVERNANCE.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before opening a change. Every behavior-changing pull request starts with stable requirement IDs, updates the threat model when a boundary changes, and records verification evidence with honest scope.
+Use GitHub as the shared source of truth. Start work from an updated `main`, use
+one focused branch per change, push it to your fork or the project repository,
+and open a pull request. Before moving to another laptop, commit and push every
+intended source change; never synchronize `node_modules`, `target`, local
+databases, credentials, exports, or signing material.
 
-Security vulnerabilities must be reported through a private channel described in [SECURITY.md](SECURITY.md), never through a public issue with exploit details or sensitive data.
+Read [CONTRIBUTING.md](CONTRIBUTING.md),
+[GOVERNANCE.md](GOVERNANCE.md), and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before opening a change. Security
+vulnerabilities must be reported through the private channel in
+[SECURITY.md](SECURITY.md), never through a public issue containing exploit
+details or sensitive data.
 
 ## Privacy
 
-Conversation content is stored locally in user-scoped SQLite without application-level database encryption. Explicit exports are plaintext JSON and must be handled as sensitive files. Content sent by the user is processed by Z.AI under the provider's current terms and retention policy.
+Conversation content is stored locally in user-scoped SQLite without
+application-level database encryption. Explicit exports are plaintext JSON and
+must be handled as sensitive files. Content selected for a send is processed by
+the chosen external provider under that provider's current terms and retention
+policy; Alibaba Cloud uses the fixed US-region API boundary.
 
-Never commit API keys, conversation exports, user databases, signing material, or private evidence. The repository secret scan is a release gate, not a replacement for credential hygiene.
+Never commit API keys, conversation exports, user databases, balance details,
+signing material, or private evidence. Repository scanning is a release gate,
+not a replacement for credential hygiene.
 
 ## License
 
-Except where otherwise noted, Aster Desktop's project-owned source code, documentation, configuration, and assets are licensed under the [Apache License 2.0](LICENSE). You may use, modify, and distribute the work subject to that license, including its requirements to provide the license, preserve applicable notices, and identify modified files. Apache-2.0 also includes a conditional patent grant, does not grant trademark rights, and provides the work without warranty.
+Except where otherwise noted, Aster Desktop's project-owned source code,
+documentation, configuration, and assets are licensed under the
+[Apache License 2.0](LICENSE). You may use, modify, and distribute the work
+subject to that license, including its notice and modification requirements.
 
-See [NOTICE](NOTICE) for required attribution and separately licensed material. In particular, portions of [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) are adapted from Contributor Covenant 2.1 under CC BY 4.0. Third-party dependencies and bundled third-party components retain their respective licenses; consult the lockfiles, generated CycloneDX SBOMs, and dependency license reports before redistribution.
+See [NOTICE](NOTICE) for attribution and separately licensed material. Third-party
+dependencies retain their own licenses; consult the lockfiles, generated
+CycloneDX SBOMs, and dependency license reports before redistribution.
