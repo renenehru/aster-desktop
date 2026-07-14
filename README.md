@@ -20,6 +20,25 @@ network endpoint.
 > reported only through revision-specific evidence with exact `PASS`, `FAIL`,
 > and `NOT RUN` outcomes.
 
+## Choose MVP v1 or MVP v2
+
+MVP v1 and MVP v2 are public engineering source baselines, not two signed
+installer releases. MVP v1 is the historical Z.AI `glm-5.1` implementation;
+MVP v2 is the current development line with 5 providers, 17 exact model
+identifiers, provider-scoped credentials, and local Usage/account workflows.
+
+| Baseline         | Best fit                                                                       | Public source                                                                                                          |
+| ---------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| MVP v1 (`0.1.0`) | A deliberately minimal Z.AI `glm-5.1` reference or specialized historical fork | [Apache-2.0 source snapshot](https://github.com/renenehru/aster-desktop/tree/39c6cc74f6115b4ba68b474648f8314d8be9f03e) |
+| MVP v2 (`0.2.0`) | New Aster development and curated multi-provider projects                      | [MVP v2 pull request](https://github.com/renenehru/aster-desktop/pull/10)                                              |
+
+Read the [MVP v1 versus MVP v2 selection guide](docs/version-selection.md)
+before choosing a checkout. It includes an exact capability matrix,
+commit-pinned source links and archives, migration and downgrade constraints, developer impact,
+support status, licensing obligations, and cases where neither version is an
+appropriate foundation. The repository currently publishes source only; it has
+no GitHub Release or production binary.
+
 ## Interface preview
 
 <p align="center">
@@ -241,6 +260,7 @@ Start with the [documentation index](docs/README.md).
 
 | Area              | Document                                                                                          |
 | ----------------- | ------------------------------------------------------------------------------------------------- |
+| Version choice    | [MVP v1 versus MVP v2 selection guide](docs/version-selection.md)                                 |
 | Product contract  | [Product specification](docs/product-spec.md)                                                     |
 | Architecture      | [Architecture and trust boundaries](docs/architecture.md)                                         |
 | Security          | [Security requirements](docs/security-requirements.md) and [threat model](docs/threat-model.md)   |

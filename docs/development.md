@@ -5,6 +5,12 @@ operational companion to the normative [product specification](product-spec.md),
 [architecture](architecture.md), [security requirements](security-requirements.md),
 and repository governance in [`AGENTS.md`](../AGENTS.md).
 
+This guide describes the current MVP v2 development line. Developers who are
+evaluating the historical Z.AI-only MVP v1 baseline should first read the
+[version selection guide](version-selection.md), check out its exact revision,
+and then use the README and toolchain instructions from that revision. Do not
+apply v2 commands or evidence claims retroactively to v1.
+
 ## Prerequisites
 
 Aster targets the Windows desktop and the MSVC Rust toolchain.

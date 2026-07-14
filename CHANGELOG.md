@@ -6,7 +6,11 @@ All notable project changes are recorded in this file. The format follows
 
 ## [Unreleased]
 
-No changes recorded.
+### Documentation
+
+- Added a developer-focused MVP v1 versus MVP v2 selection guide with an exact
+  capability matrix, commit-pinned source links and archives, migration and downgrade
+  guidance, support status, release caveats, and Apache-2.0 reuse obligations.
 
 ## [0.2.0] - 2026-07-13
 

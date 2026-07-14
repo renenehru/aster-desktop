@@ -2,6 +2,19 @@
 
 Aster Desktop is currently an MVP v2 engineering implementation for Windows 11. Support is community-based and provided on a best-effort basis; no response time, compatibility, uptime, or service-level commitment is promised.
 
+## Version support
+
+MVP v2 is the current development and community-support line. The Apache-2.0
+MVP v1 source baseline remains available for reproducibility and personal forks,
+but it is historical and is not promised ongoing compatibility or security
+backports. Use the [version selection guide](docs/version-selection.md) to compare
+capabilities, obtain the exact source snapshots, and review migration and
+downgrade limits before requesting support.
+
+Neither source baseline is a signed production release. Support applies only to
+the scope actually documented and verified for the exact revision reported by
+the requester.
+
 ## Before requesting help
 
 1. Read [README.md](README.md) for prerequisites, setup, and known scope limits.

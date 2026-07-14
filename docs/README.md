@@ -10,6 +10,7 @@ engineering governance and has precedence over every document listed here.
 
 | If you want to...                             | Read...                                                    |
 | --------------------------------------------- | ---------------------------------------------------------- |
+| Compare MVP v1 and MVP v2 before downloading  | [Version selection guide](version-selection.md)            |
 | Understand the MVP outcome and non-goals      | [Product specification](product-spec.md)                   |
 | Understand components and trust boundaries    | [Architecture](architecture.md)                            |
 | Set up a Windows development environment      | [Development guide](development.md)                        |
@@ -42,6 +43,9 @@ product specification, acceptance criteria, then implementation and tests.
 
 ## Engineering and operations guides
 
+- [Version selection](version-selection.md) compares the historical MVP v1
+  source baseline with the current MVP v2 development line, including exact
+  source links, migration limits, support status, and licensing caveats.
 - [Development](development.md) explains prerequisites, repository layout,
   fresh-laptop bootstrap, desktop and isolated browser-demo workflows, and the
   spec-first change process.
