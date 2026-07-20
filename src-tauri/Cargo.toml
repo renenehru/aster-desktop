@@ -23,7 +23,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 [dependencies]
 aster-credential-prompt = { path = "credential-prompt" }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "serde"] }
-futures-util = { version = "=0.3.32", default-features = false, features = ["std"] }
+futures-util = { version = "=0.3.33", default-features = false, features = ["std"] }
 keyring = { version = "=4.1.4", default-features = false, features = ["v1"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["http2", "json", "rustls", "stream"] }
 rfd = { version = "=0.17.2", default-features = false, features = ["common-controls-v6"] }
