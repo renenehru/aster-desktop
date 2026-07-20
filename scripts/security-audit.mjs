@@ -70,7 +70,18 @@ const licensingDocumentation = await combine([
   "docs/roadmap.md",
 ]);
 const environmentExample = await read(".env.example");
+const buildEngineering = await read("scripts/build-engineering.ps1");
+const buildIdentityModule = await read("scripts/Aster.BuildIdentity.psm1");
+const buildIdentityFixtures = await read("scripts/build-identity.fixtures.ps1");
+const packagingModule = await read("scripts/Aster.Packaging.psm1");
+const packageAuditFixtures = await read("scripts/package-audit.fixtures.ps1");
+const packageProvenanceFixtures = await read("scripts/package-provenance.fixtures.ps1");
 const packageEngineering = await read("scripts/package-engineering.ps1");
+const packageAudit = await read("scripts/package-audit.ps1");
+const verificationScript = await read("scripts/verify.ps1");
+const secretScanner = await read("scripts/secret-scan.mjs");
+const secretPatternFixtureTest = await read("scripts/secret-patterns.fixtures.mjs");
+const sharedSecretPatterns = JSON.parse(await read("scripts/secret-patterns.json"));
 const frontendSbomGenerator = await read("scripts/generate-sbom.mjs");
 const rustSbomGenerator = await read("scripts/generate-rust-sbom.mjs");
 const ciWorkflow = await read(".github/workflows/ci.yml");
@@ -94,6 +105,23 @@ const applicationRust = await combine(applicationRustFiles);
 const rustEntry = await read("src-tauri/src/lib.rs");
 const rustMain = await read("src-tauri/src/main.rs");
 
+const shippedProviderOrigins = [
+  "https://api.z.ai",
+  "https://api.deepseek.com",
+  "https://dashscope-us.aliyuncs.com",
+  "https://generativelanguage.googleapis.com",
+  "https://integrate.api.nvidia.com",
+];
+const shippedAccountOrigins = [
+  "https://z.ai",
+  "https://platform.deepseek.com",
+  "https://modelstudio.console.alibabacloud.com",
+  "https://usercenter2-intl.console.alibabacloud.com",
+  "https://billing-cost-intl.aliyun.com",
+  "https://aistudio.google.com",
+  "https://build.nvidia.com",
+];
+
 const productionCsp = String(tauri.app?.security?.csp ?? "");
 assert(productionCsp.includes("default-src 'self'"), "Tauri CSP must default to self.");
 assert(productionCsp.includes("script-src 'self'"), "Tauri CSP must restrict scripts to self.");
@@ -110,6 +138,14 @@ assert(
   "Tauri must freeze the JavaScript prototype.",
 );
 assert(
+  packageManifest.version === "0.2.0" && tauri.version === packageManifest.version,
+  "The npm and Tauri manifests must identify the same MVP v2 version.",
+);
+assert(
+  /^version\s*=\s*"0\.2\.0"$/m.test(mainCargo) && /^version\s*=\s*"0\.2\.0"$/m.test(helperCargo),
+  "Every first-party Rust package must identify MVP v2 as version 0.2.0.",
+);
+assert(
   tauri.build?.devUrl === undefined,
   "The production Tauri configuration must not embed a development endpoint.",
 );
@@ -124,20 +160,128 @@ assert(
   "The explicit development overlay must remain loopback-only and contain its development CSP.",
 );
 assert(
-  /&\s*\$git\s+-C\s+\$root\s+status\s+--porcelain=v1\s+--untracked-files=normal/.test(
-    packageEngineering,
-  ),
-  "Source packaging must reject a dirty Git working tree.",
+  packageEngineering.includes("[string]$VerifierIdentity") &&
+    packageEngineering.includes("Invoke-AsterEngineeringPackage") &&
+    !packageEngineering.includes("Identity: local Codex verification session"),
+  "The public packaging wrapper must require a validated caller-supplied identity and delegate to the reviewed module.",
 );
 assert(
-  /&\s*\$git\s+-C\s+\$root\s+archive\s+--format=zip\s+--output=\$sourceArchive\s+HEAD/.test(
-    packageEngineering,
-  ),
-  "Source packaging must archive tracked files from the identified HEAD commit.",
+  buildEngineering.includes("Import-Module $identityModule -Force") &&
+    packagingModule.includes("Import-Module $identityModule -Force") &&
+    buildIdentityModule.includes("function Get-AsterFileIdentity") &&
+    buildIdentityModule.includes("function Get-AsterDirectoryDigest") &&
+    buildIdentityModule.includes("function Assert-AsterNoReparseAncestors") &&
+    buildIdentityModule.includes("function Remove-AsterSafeDirectoryTree"),
+  "Build and package scripts must share reparse-safe identity and filesystem primitives.",
 );
 assert(
-  !packageEngineering.includes("--exclude=") && !packageEngineering.includes("tar.exe"),
-  "Source packaging must not archive the working directory through a hard-coded denylist.",
+  buildIdentityFixtures.includes("The directory digest did not detect a changed frontend asset") &&
+    buildIdentityFixtures.includes(
+      "depends on the current culture instead of ordinal path order",
+    ) &&
+    buildIdentityFixtures.includes("Windows junction") &&
+    buildIdentityFixtures.includes("accepted a file outside the repository root") &&
+    packageManifest.scripts?.["security:build-identity"] ===
+      "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-identity.fixtures.ps1" &&
+    packageManifest.scripts?.check?.includes("pnpm security:build-identity") &&
+    ciWorkflow.includes("run: pnpm security:build-identity"),
+  "Local and CI gates must exercise clean-revision build-identity positive and negative fixtures.",
+);
+assert(
+  buildEngineering.includes("Engineering builds require a completely clean Git working tree") &&
+    buildEngineering.includes("The tracked source changed during the engineering build") &&
+    buildEngineering.includes('Join-Path $work "build-identity.json"') &&
+    buildEngineering.includes("releaseBinary = Get-AsterFileIdentity") &&
+    buildEngineering.includes("installer = Get-AsterFileIdentity") &&
+    buildEngineering.includes("frontend = Get-AsterFileIdentity") &&
+    buildEngineering.includes("rust = Get-AsterFileIdentity") &&
+    buildEngineering.includes("sha256 = Get-AsterDirectoryDigest"),
+  "Engineering builds must bind executable, installer, SBOMs, and dist to one clean revision.",
+);
+assert(
+  packagingModule.includes(
+    "work/evidence/YYYY-MM-DD-<full-source-revision>-engineering-build.md",
+  ) &&
+    packagingModule.includes("Get-AsterEvidenceText") &&
+    packagingModule.includes("Get-AsterStrictBuildIdentity") &&
+    packagingModule.includes("exact duplicate-free schema") &&
+    packagingModule.includes("Assert-AsterZipInventory") &&
+    packagingModule.includes("source-inventory.json") &&
+    packagingModule.includes("work\\package-staging") &&
+    packagingModule.includes("Self-declared verifier identity") &&
+    packagingModule.includes("verification-evidence.log") &&
+    packagingModule.includes("A PASS result must identify the canonical retained evidence log") &&
+    packagingModule.includes("exactly one canonical unsigned engineering classification") &&
+    packagingModule.includes("EvidenceLog = $evidenceLog") &&
+    packagingModule.includes("$validatedEvidenceLog") &&
+    packagingModule.includes("[System.IO.Directory]::Move($staging, $output)") &&
+    !packagingModule.includes("FixtureAfterMoveHook") &&
+    !packagingModule.includes("--exclude=") &&
+    !packagingModule.includes("tar.exe"),
+  "Engineering packaging must stage, revalidate, inventory, and safely publish one exact clean revision.",
+);
+assert(
+  packageManifest.scripts?.["security:package-audit"] ===
+    "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-audit.fixtures.ps1" &&
+    packageManifest.scripts?.check?.includes("pnpm security:package-audit") &&
+    ciWorkflow.includes("run: pnpm security:package-audit") &&
+    packageAudit.includes("foreach ($offset in @(0, 1))") &&
+    packageAuditFixtures.includes("UTF-16LE offset 1") &&
+    packageAuditFixtures.includes("UTF-16BE offset 1") &&
+    packageAuditFixtures.includes("Binary package-audit alignment fixtures passed"),
+  "Local and CI gates must scan UTF-16LE/BE binary secrets at both byte alignments.",
+);
+assert(
+  buildIdentityModule.includes("[System.Security.Cryptography.SHA256]::Create()") &&
+    !buildIdentityModule.includes("Get-FileHash") &&
+    !packagingModule.includes("Get-FileHash") &&
+    packagingModule.includes('return "NOT RUN (verifier unavailable)"') &&
+    packagingModule.includes('$securityModule.ExportedCommands["Get-AuthenticodeSignature"]') &&
+    packagingModule.includes("The Authenticode verifier contract is invalid.") &&
+    packagingModule.includes("The Authenticode verifier returned an invalid status.") &&
+    packagingModule.includes("it is not signature") &&
+    packageProvenanceFixtures.includes("The unavailable Authenticode verifier fixture") &&
+    packageProvenanceFixtures.includes('"NOT RUN (verifier unavailable)"'),
+  "Build and packaging identity must not depend on the optional Get-FileHash cmdlet.",
+);
+assert(
+  packageManifest.scripts?.["security:package-provenance"] ===
+    "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-provenance.fixtures.ps1" &&
+    packageManifest.scripts?.check?.includes("pnpm security:package-provenance") &&
+    ciWorkflow.includes("run: pnpm security:package-provenance") &&
+    packageProvenanceFixtures.includes("Package-provenance fixtures passed") &&
+    packageProvenanceFixtures.includes("source-archive inventory fixture") &&
+    packageProvenanceFixtures.includes("unsafe archive-directory fixture") &&
+    packageProvenanceFixtures.includes("regular-to-symlink archive fixture") &&
+    packageProvenanceFixtures.includes("missing ZIP parent-directory fixture") &&
+    packageProvenanceFixtures.includes("invalid ZIP directory-mode fixture") &&
+    packageProvenanceFixtures.includes("JSON-escaped user path") &&
+    packageProvenanceFixtures.includes("Unicode slash-escaped user path") &&
+    packageProvenanceFixtures.includes("duplicate JSON key") &&
+    packageProvenanceFixtures.includes("unsafe-range JSON integer") &&
+    packageProvenanceFixtures.includes("missing procedure identity") &&
+    packageProvenanceFixtures.includes("duplicate engineering classification") &&
+    packageProvenanceFixtures.includes("production classification") &&
+    packageProvenanceFixtures.includes("unbackticked result row") &&
+    packageProvenanceFixtures.includes("indented malformed result row") &&
+    packageProvenanceFixtures.includes("duplicate conflicting gate result") &&
+    packageProvenanceFixtures.includes("whitespace-padded gate alias") &&
+    packageProvenanceFixtures.includes("PASS without reviewable evidence") &&
+    packageProvenanceFixtures.includes("missing retained evidence-log fixture") &&
+    packageProvenanceFixtures.includes("invalid retained evidence-log UTF-8 fixture") &&
+    packageProvenanceFixtures.includes("oversized retained evidence-log fixture") &&
+    packageProvenanceFixtures.includes("personal-path retained evidence-log fixture") &&
+    packageProvenanceFixtures.includes("credential-header retained evidence-log fixture") &&
+    packageProvenanceFixtures.includes("shared-secret retained evidence-log fixture") &&
+    packageProvenanceFixtures.includes("post-copy mismatch fixture") &&
+    packageProvenanceFixtures.includes("post-copy evidence-log mismatch fixture") &&
+    packageProvenanceFixtures.includes("atomic publication-race fixture") &&
+    packageProvenanceFixtures.includes("locked publication-child fixture") &&
+    packageProvenanceFixtures.includes("unpublished candidate received the final output name") &&
+    packageProvenanceFixtures.includes("final-package mismatch fixture") &&
+    packageProvenanceFixtures.includes("final-state mismatch fixture") &&
+    packageProvenanceFixtures.includes("package-junction fixture"),
+  "Local and CI gates must execute the temp-repository package-provenance abuse suite.",
 );
 assert(
   createHash("sha256").update(projectLicense).digest("hex") ===
@@ -168,15 +312,17 @@ assert(
   "NOTICE must preserve the project attribution, Contributor Covenant CC BY 4.0 notice, and Mozilla attribution.",
 );
 assert(
-  /Copy-Item\s+-LiteralPath\s+\$license\s+-Destination\s+\$licenseOutput/.test(
-    packageEngineering,
+  packagingModule.includes(
+    "Copy-AsterFileSafely -RepositoryRoot $root -Source $license -Destination $paths.licenseOutput",
   ) &&
-    /Copy-Item\s+-LiteralPath\s+\$notice\s+-Destination\s+\$noticeOutput/.test(packageEngineering),
+    packagingModule.includes(
+      "Copy-AsterFileSafely -RepositoryRoot $root -Source $notice -Destination $paths.noticeOutput",
+    ),
   "Engineering handoffs must copy LICENSE and NOTICE beside distributable artifacts.",
 );
 assert(
-  /\$identityTargets\s*=\s*@\([\s\S]*?\$licenseOutput[\s\S]*?\$noticeOutput[\s\S]*?\)/.test(
-    packageEngineering,
+  /\$identityTargets\s*=\s*@\([\s\S]*?\$paths\.licenseOutput[\s\S]*?\$paths\.noticeOutput[\s\S]*?\)/.test(
+    packagingModule,
   ),
   "Engineering artifact identity and checksums must cover LICENSE and NOTICE.",
 );
@@ -207,6 +353,38 @@ assert(
 assert(
   !/^\s*[A-Z][A-Z0-9_]*\s*=/m.test(environmentExample),
   "The environment example must not advertise unsupported secret, endpoint, or diagnostic configuration.",
+);
+const requiredSecretPatternNames = [
+  "AWS access key",
+  "GitHub token",
+  "Google API key",
+  "NVIDIA API key",
+  "assigned credential",
+  "private key",
+  "sk-prefixed provider token",
+];
+assert(
+  Array.isArray(sharedSecretPatterns) &&
+    JSON.stringify(sharedSecretPatterns.map(({ name }) => name).sort()) ===
+      JSON.stringify(requiredSecretPatternNames),
+  "The shared credential scanner must retain the reviewed provider and generic secret rules.",
+);
+assert(
+  secretScanner.includes('scripts", "secret-patterns.json') &&
+    packageAudit.includes('Join-Path $PSScriptRoot "secret-patterns.json"') &&
+    secretPatternFixtureTest.includes("Every shared secret rule needs a fixture.") &&
+    packageManifest.scripts?.["security:patterns"] ===
+      "node scripts/secret-patterns.fixtures.mjs" &&
+    packageManifest.scripts?.check?.includes("pnpm security:patterns") &&
+    ciWorkflow.includes("run: pnpm security:patterns"),
+  "Repository and packaged-artifact scans must share tested credential patterns.",
+);
+assert(
+  packageManifest.scripts?.verify ===
+    "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1" &&
+    verificationScript.includes("were NOT RUN because -SkipRust was selected") &&
+    verificationScript.includes("Full frontend and Rust verification completed successfully."),
+  "The verify command must run the full orchestrator and label skipped Rust gates as NOT RUN.",
 );
 
 const approvedCiActionPins = new Set([
@@ -277,6 +455,38 @@ assert(
   JSON.stringify(actualWindowPermissions) === JSON.stringify(expectedWindowPermissions),
   "The custom title bar must have exactly the four approved core window permissions.",
 );
+const expectedApplicationPermissions = [
+  "allow-acknowledge-external-processing",
+  "allow-app-status",
+  "allow-cancel-generation",
+  "allow-create-conversation",
+  "allow-deepseek-balance-status",
+  "allow-delete-api-key",
+  "allow-delete-conversation",
+  "allow-export-conversation",
+  "allow-get-conversation",
+  "allow-import-conversations",
+  "allow-list-conversations",
+  "allow-model-catalog",
+  "allow-open-external-url",
+  "allow-open-provider-account",
+  "allow-prompt-store-api-key",
+  "allow-provider-statuses",
+  "allow-refresh-deepseek-balance",
+  "allow-rename-conversation",
+  "allow-send-message",
+  "allow-set-usage-budget",
+  "allow-update-conversation-selection",
+  "allow-usage-summary",
+];
+const actualApplicationPermissions = permissions
+  .filter((permission) => String(permission).startsWith("allow-"))
+  .map(String)
+  .sort();
+assert(
+  JSON.stringify(actualApplicationPermissions) === JSON.stringify(expectedApplicationPermissions),
+  "The main window must expose exactly the specified MVP v2 application commands.",
+);
 assert(
   tauri.app?.windows?.[0]?.decorations === false,
   "The custom title bar requires native decorations to be disabled.",
@@ -293,16 +503,45 @@ assert(
   !permissions.includes("allow-store-api-key"),
   "ADR-0008 forbids the retired renderer-to-Rust credential value permission.",
 );
+assert(
+  !permissions.includes("allow-credential-status"),
+  "Provider-scoped credential status must replace the retired global credential command.",
+);
 
 const frontendForbidden = [
   ["dangerouslySetInnerHTML", "The renderer must not use dangerouslySetInnerHTML."],
   ["localStorage", "The renderer must not use localStorage."],
   ["sessionStorage", "The renderer must not use sessionStorage."],
-  ["https://api.z.ai", "The renderer must not contain the provider endpoint."],
 ];
 for (const [needle, message] of frontendForbidden) {
   assert(!frontend.includes(needle), message);
 }
+for (const origin of [...shippedProviderOrigins, ...shippedAccountOrigins]) {
+  assert(!frontend.includes(origin), `The renderer must not contain the fixed origin ${origin}.`);
+}
+for (const origin of shippedProviderOrigins) {
+  assert(
+    applicationRust.includes(origin),
+    `The Rust-owned registry must contain the verified provider origin ${origin}.`,
+  );
+}
+for (const origin of shippedAccountOrigins) {
+  assert(
+    applicationRust.includes(origin),
+    `The Rust-owned account-action map must contain the fixed origin ${origin}.`,
+  );
+}
+const reqwestClientBuilders = applicationRust.match(/\bClient::builder\(\)/g) ?? [];
+const disabledReqwestRetryPolicies =
+  applicationRust.match(/\.retry\(reqwest::retry::never\(\)\)/g) ?? [];
+const sharedProviderBuilderUses =
+  applicationRust.match(/let client = provider_client_builder\(\)/g) ?? [];
+assert(
+  reqwestClientBuilders.length === 1 &&
+    disabledReqwestRetryPolicies.length === 1 &&
+    sharedProviderBuilderUses.length === 2,
+  "Every production and controlled provider client must use the one shared reqwest builder with retries explicitly disabled.",
+);
 assert(!/\bfetch\s*\(/.test(frontend), "The renderer must not make direct fetch calls.");
 assert(!/\bWebSocket\s*\(/.test(frontend), "The renderer must not open WebSockets.");
 assert(
@@ -318,8 +557,10 @@ assert(
   "ADR-0008 forbids the retired secret-bearing renderer IPC command.",
 );
 assert(
-  /\binvokeDesktop\s*\(\s*["']prompt_store_api_key["']\s*,\s*\{\s*\}\s*\)/.test(frontend),
-  "The renderer must invoke the native credential prompt through the raw-body helper with no arguments.",
+  /\binvokeDesktop\s*\(\s*["']prompt_store_api_key["']\s*,\s*\{\s*providerId\s*\}\s*\)/.test(
+    frontend,
+  ),
+  "The renderer must invoke the native credential prompt with only the selected provider ID.",
 );
 const directInvokeSites = frontend.match(/\binvoke(?:\s*<[^>\n]+>)?\s*\(/g) ?? [];
 assert(

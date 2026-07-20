@@ -43,6 +43,14 @@ jobs:
         run: pnpm typecheck
       - name: Build production frontend
         run: pnpm build
+      - name: Verify clean-revision build-identity fixtures
+        run: pnpm security:build-identity
+      - name: Verify binary package-audit alignment fixtures
+        run: pnpm security:package-audit
+      - name: Verify package-provenance abuse fixtures
+        run: pnpm security:package-provenance
+      - name: Verify shared secret-pattern fixtures
+        run: pnpm security:patterns
       - name: Scan tracked content for secrets
         run: pnpm security:secrets
       - name: Assert security configuration

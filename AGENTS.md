@@ -4,19 +4,23 @@ This file is the governing instruction set for every human or automated contribu
 
 ## 1. Product and trust boundary
 
-The product is a Windows 11 desktop chat client built with Tauri, React, TypeScript, Rust, SQLite, and the official Z.AI chat API. The verified MVP provider contract uses `glm-5.1`; do not restore the source plan's unverified `glm-5.2`, `reasoning_effort: high`, or `reasoning_effort: max` assumptions without a new contract verification and spec change. The dated external contract record is [docs/provider-contract.md](docs/provider-contract.md). The React webview is a presentation layer and is never a trusted place for secrets or privileged operations.
+The product is a Windows 11 desktop chat client built with Tauri, React, TypeScript, Rust, and SQLite. MVP v2 sends chat requests directly from Rust to a curated set of official provider-hosted APIs. A provider/model pair may ship only when its exact identifier, official HTTPS inference endpoint, authentication, request/response contract, token-usage fields, and supported response-profile mappings are recorded in the dated [provider contract baseline](docs/provider-contract.md). A requested name that does not meet that bar is omitted from the product catalog; it is not displayed as an unavailable option. The React webview is a presentation layer and is never a trusted place for secrets or privileged operations.
 
-The provider exposes a verified `thinking.type` switch with `enabled` and `disabled` values. Fast, Standard, and Deep are application-owned response profiles. They must not be described as three provider reasoning-effort levels: Standard and Deep both send `thinking.type: "enabled"` and differ only in the application's output-token cap and user guidance. A provider-contract document or passing contract test verifies an external interface; it does not by itself prove that the shipped implementation uses that interface correctly.
+Fast, Standard, and Deep are application-owned response profiles, not three universal provider reasoning levels. Rust applies only the model-specific mapping verified in the provider contract. Unsupported profiles are disabled with an accurate explanation; the application must never invent a translation, silently drop a field, or fall back to a different model. A provider-contract document or passing contract test verifies an external interface; it does not by itself prove that the shipped implementation uses that interface correctly.
 
 The following boundaries are non-negotiable:
 
-- React may call only explicitly registered, typed Tauri commands and may not call Z.AI directly.
-- The API key may exist only in the Rust process for the minimum practical lifetime and in the Windows credential store at rest. It must never be placed in frontend state, browser storage, SQLite, logs, fixtures, source code, build arguments, or packaged assets.
+- React may call only explicitly registered, typed Tauri commands and may not call any AI provider directly.
+- Each provider API key may exist only in the Rust process for the minimum practical lifetime and in a separate provider-scoped Windows credential-store target at rest. It must never be placed in frontend state, browser storage, SQLite, logs, fixtures, source code, build arguments, or packaged assets, and a credential for one provider must never be sent to another.
 - Credential setup must use the Rust-owned native Windows prompt defined by `ADR-0008`. The webview must not render a credential field or carry the key in an IPC argument, result, or event.
 - The Rust backend owns provider networking, SSE parsing, request cancellation, persistence, import/export validation, and security-relevant policy decisions.
-- Provider traffic is restricted to the documented Z.AI HTTPS origin and uses normal platform certificate validation. Certificate bypasses are prohibited.
+- Provider traffic is restricted to the exact official HTTPS origins and paths in the Rust-owned catalog and uses normal platform certificate validation. The renderer, imported data, conversation content, and user configuration may not add or override an origin, path, model, proxy, or authorization header. Certificate bypasses are prohibited.
+- MVP v2 chat and balance operations are never retried automatically. A retry is a new explicit user operation; the application must not hide a second potentially billable request.
+- Provider/model identity is immutable after the first message is persisted in a conversation. Changing the selection starts a new conversation; edit, resend, regenerate, stream events, credentials, and usage remain bound to the original pair.
+- Local token accounting is advisory product state derived only from validated provider usage metadata. It must identify incomplete data and must not be described as provider billing or credit. Exact balance retrieval is allowed only for the documented DeepSeek read-only endpoint and only after an explicit user action.
+- Credit, plan, and provider-usage account actions accept only a typed provider/action pair. Rust maps that pair to a fixed official HTTPS URL and opens it in the default browser. Aster never buys credits, changes plans, accepts a renderer-supplied account URL, or embeds provider account pages.
 - Model output, imported conversations, database content, IPC arguments, and stream events are untrusted input.
-- Arbitrary command execution, shell access, filesystem tools, projects, document attachments, and model-invoked tools are outside MVP v1. A visible preview must be labelled unavailable and must not silently expose a backend capability.
+- Arbitrary command execution, shell access, filesystem tools, projects, document attachments, and model-invoked tools are outside MVP v2. A visible preview must be labelled unavailable and must not silently expose a backend capability.
 - Browser-only mode is for visual QA. It may use an in-memory demo adapter, but it must not accept, request, persist, or transmit an API key and must clearly identify itself as demo mode.
 
 The normative product boundary is in [docs/product-spec.md](docs/product-spec.md). The architecture and trust boundaries are in [docs/architecture.md](docs/architecture.md).
@@ -77,7 +81,7 @@ Conflicts must be corrected in the same change. Implementation does not silently
 - Never commit a real API key or personal conversation data. Use unmistakably fake values such as `test_key_not_a_secret` in tests.
 - Do not print authorization headers, credential-store values, prompts, responses, imported content, database rows, or full provider payloads. Logs use request-scoped opaque IDs and safe metadata only.
 - Zeroize or drop secret-bearing values as soon as practical. Error types and debug formatting must not include secrets.
-- Local conversations are not synchronized by the application. Any content sent to Z.AI requires a visible external-processing notice.
+- Local conversations are not synchronized by the application. Before content is sent, the UI must identify the selected external provider and region when the contract is region-specific, including the fixed Alibaba Cloud US-region boundary.
 - Export is an explicit user action. The UI warns that an export can contain sensitive plaintext.
 
 ### 3.2 Frontend and rendering
@@ -103,7 +107,7 @@ Conflicts must be corrected in the same change. Implementation does not silently
 - Import must not interpret HTML, scripts, paths, URLs, or commands. An invalid import must not partially mutate the database.
 - Export paths must come from the native save dialog or an equivalent scoped handle. Do not concatenate user input into filesystem paths.
 - Destructive actions require deliberate UI confirmation and transaction-safe backend behavior.
-- Network operations have explicit connect, request, idle/read, and overall limits as applicable. Retries are bounded, use jittered backoff, honor provider guidance, and do not retry authentication failures.
+- Network operations have explicit connect, request, idle/read, and overall limits as applicable. MVP v2 performs no automatic provider retry; any future retry policy requires a specification, threat, cost, and duplicate-consumption review before implementation.
 
 ### 3.5 Dependencies and supply chain
 

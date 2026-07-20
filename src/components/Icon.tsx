@@ -8,6 +8,7 @@ export type IconName =
   | "code"
   | "copy"
   | "download"
+  | "external"
   | "edit"
   | "file"
   | "folder"
@@ -27,6 +28,7 @@ export type IconName =
   | "stop"
   | "trash"
   | "upload"
+  | "warning"
   | "x";
 
 interface IconProps extends SVGProps<SVGSVGElement> {
@@ -91,6 +93,13 @@ export function Icon({ name, size = 18, ...props }: IconProps) {
       return (
         <svg {...common}>
           <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" />
+        </svg>
+      );
+    case "external":
+      return (
+        <svg {...common}>
+          <path d="M14 4h6v6M20 4l-9 9" />
+          <path d="M18 13v6H5V6h6" />
         </svg>
       );
     case "edit":
@@ -216,6 +225,13 @@ export function Icon({ name, size = 18, ...props }: IconProps) {
       return (
         <svg {...common}>
           <path d="M12 16V4m0 0L8 8m4-4 4 4M5 20h14" />
+        </svg>
+      );
+    case "warning":
+      return (
+        <svg {...common}>
+          <path d="M12 3 2.8 20h18.4z" />
+          <path d="M12 9v5M12 17.2h.01" />
         </svg>
       );
     case "x":

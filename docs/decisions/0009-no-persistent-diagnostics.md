@@ -6,6 +6,10 @@
 
 **Decision owners:** `SEC-003`, `SEC-020`, `SEC-023`, `SEC-029`-`SEC-031`, `AC-012`, `AC-026`, `AC-029`
 
+**MVP v2 applicability:** Adopted unchanged. Aster MVP v2 adds provider-scoped
+safe states but no application diagnostic log, telemetry, analytics, or crash
+reporting sink.
+
 ## Context
 
 The original architecture described a bounded metadata-only diagnostic log, but the MVP implementation has no logging subsystem, retention configuration, protected viewer, or evidence that every sensitive error path is redacted. Adding one solely to match prose would create a new persistence path for potentially sensitive data without improving the core chat workflow.

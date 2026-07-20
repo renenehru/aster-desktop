@@ -5,6 +5,12 @@ operational companion to the normative [product specification](product-spec.md),
 [architecture](architecture.md), [security requirements](security-requirements.md),
 and repository governance in [`AGENTS.md`](../AGENTS.md).
 
+This guide describes the current MVP v2 development line. Developers who are
+evaluating the historical Z.AI-only MVP v1 baseline should first read the
+[version selection guide](version-selection.md), check out its exact revision,
+and then use the README and toolchain instructions from that revision. Do not
+apply v2 commands or evidence claims retroactively to v1.
+
 ## Prerequisites
 
 Aster targets the Windows desktop and the MSVC Rust toolchain.
@@ -30,7 +36,30 @@ rustc --version
 cargo --version
 ```
 
-## Bootstrap a checkout
+## Bootstrap a checkout on each laptop
+
+Clone or update the repository through GitHub. Do not copy a working directory,
+`node_modules`, Cargo output, local database, credential material, or generated
+artifacts between laptops.
+
+```powershell
+git clone https://github.com/renenehru/aster-desktop.git
+Set-Location aster-desktop
+git switch main
+git pull --ff-only
+```
+
+For an existing checkout, commit or stash only intentional source changes before
+switching machines. Push the feature branch from the first laptop, fetch it from
+the next laptop, and continue there:
+
+```powershell
+git fetch --prune origin
+git switch --track origin/feature/<short-name>
+```
+
+Each laptop has its own Windows Credential Manager and local Aster database.
+Provider keys and conversation history are not synchronized by Git.
 
 From the repository root:
 
@@ -71,7 +100,8 @@ configuration. The overlay permits only the loopback Vite endpoint on port 1420.
 development URL or development CSP.
 
 Interactive desktop development uses the normal application adapters and may
-access the current user's Aster database and credential-store entry. Do not use
+access the current user's Aster database and provider-scoped credential-store
+targets. Do not use
 a personal or production credential in automated tests, screenshots, fixtures,
 or retained evidence. Native credential tests require an isolated Windows
 target and an unmistakably fake sentinel as defined by the acceptance criteria.
@@ -85,27 +115,28 @@ pnpm dev
 ```
 
 The browser profile is intentionally labelled **Demo mode**. It uses an
-in-memory adapter, has no provider credential method, makes no provider request,
-and provides no evidence for desktop IPC, credential storage, native dialogs,
-SQLite persistence, provider networking, packaging, or signing.
+in-memory catalog and synthetic Usage data, has no provider credential method,
+makes no provider, balance, or account-management request, and provides no
+evidence for desktop IPC, credential storage, native dialogs, SQLite persistence,
+provider networking, packaging, or signing.
 
 ## Repository map
 
-| Path                               | Responsibility                                                                                |
-| ---------------------------------- | --------------------------------------------------------------------------------------------- |
-| `src/App.tsx`                      | Application shell and UI state orchestration                                                  |
-| `src/components/`                  | Reusable UI controls and safe Markdown presentation                                           |
-| `src/services/assistantAdapter.ts` | Browser demo adapter and typed desktop IPC adapter                                            |
-| `src/types/`                       | Shared frontend domain types                                                                  |
-| `src-tauri/src/lib.rs`             | Tauri command registration, command validation, stream coordination, and application assembly |
-| `src-tauri/src/api/`               | Fixed-origin Z.AI request mapping, bounded SSE parsing, retry, and cancellation logic         |
-| `src-tauri/src/database/`          | SQLite migrations, parameterized repository operations, import, and export validation         |
-| `src-tauri/src/credentials/`       | Windows credential-store adapter                                                              |
-| `src-tauri/credential-prompt/`     | Isolated native Windows credential prompt and its reviewed FFI boundary                       |
-| `src-tauri/capabilities/main.json` | Least-privilege permissions for the main window                                               |
-| `src-tauri/IPC_CONTRACT.md`        | Exact renderer-to-Rust command and event contract                                             |
-| `scripts/`                         | Verification, policy, SBOM, build, audit, and engineering-packaging automation                |
-| `docs/`                            | Normative specifications, ADRs, evidence policy, and contributor guides                       |
+| Path                               | Responsibility                                                                                         |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `src/App.tsx`                      | Application shell and UI state orchestration                                                           |
+| `src/components/`                  | Reusable UI controls and safe Markdown presentation                                                    |
+| `src/services/assistantAdapter.ts` | Browser demo adapter and typed desktop IPC adapter                                                     |
+| `src/types/`                       | Shared frontend domain types                                                                           |
+| `src-tauri/src/lib.rs`             | Tauri command registration, command validation, stream coordination, and application assembly          |
+| `src-tauri/src/api/`               | Exact per-provider request mapping, bounded SSE parsing, one-attempt transport, and cancellation logic |
+| `src-tauri/src/database/`          | SQLite migrations, parameterized repository operations, import, and export validation                  |
+| `src-tauri/src/credentials/`       | Provider-scoped Windows credential-store adapter                                                       |
+| `src-tauri/credential-prompt/`     | Isolated native Windows credential prompt and its reviewed FFI boundary                                |
+| `src-tauri/capabilities/main.json` | Least-privilege permissions for the main window                                                        |
+| `src-tauri/IPC_CONTRACT.md`        | Exact renderer-to-Rust command and event contract                                                      |
+| `scripts/`                         | Verification, policy, SBOM, build, audit, and engineering-packaging automation                         |
+| `docs/`                            | Normative specifications, ADRs, evidence policy, and contributor guides                                |
 
 The React webview is a presentation layer. It must not own secrets, provider
 networking, filesystem paths, SQL, or security decisions. The Rust process owns
@@ -157,12 +188,64 @@ URL through a new command.
 
 ### Provider behavior
 
-The verified MVP contract is `glm-5.1` at the fixed Z.AI HTTPS origin documented
-in [provider-contract.md](provider-contract.md). Fast disables provider thinking;
-Standard and Deep both enable it and differ in application output-token caps and
-guidance. A model, origin, request-field, streaming, or timeout change requires
-contract verification plus specification, privacy, architecture, threat, and
-test updates before implementation.
+The MVP v2 catalog is a closed Rust-owned registry. It contains exactly these
+provider/model pairs:
+
+| Provider           | Exact model identifiers                                                                         |
+| ------------------ | ----------------------------------------------------------------------------------------------- |
+| Z.AI               | `glm-4.7`, `glm-5`, `glm-5.1`, `glm-5.2`                                                        |
+| DeepSeek           | `deepseek-v4-flash`, `deepseek-v4-pro`                                                          |
+| Alibaba Cloud (US) | `qwen3.5-plus`, `qwen3.5-flash`, `qwen3.6-plus`, `qwen3.6-flash`, `qwen3.7-plus`, `qwen3.7-max` |
+| Google Gemini      | `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.5-pro`                                   |
+| NVIDIA             | `nvidia/nemotron-3-super-120b-a12b`, `nvidia/nemotron-3-ultra-550b-a55b`                        |
+
+Alibaba Cloud is fixed to the US-region API and must be identified as such
+before content is sent. NVIDIA entries are hosted prototypes for evaluation.
+The exact endpoints, authentication, request fields, stream formats, usage
+mapping, and Fast/Standard/Deep behavior are dated in
+[provider-contract.md](provider-contract.md). A model appears only when its full
+contract is verified; do not add placeholders or unavailable entries.
+
+Each provider key is captured by the Rust-owned native prompt and stored in a
+separate Windows Credential Manager target. React carries only a provider ID and
+safe configured/not-configured status. Never add a generic credential target or
+a frontend, IPC, SQLite, log, fixture, or environment path for a key.
+
+Fast, Standard, and Deep are Aster response profiles. The backend applies the
+exact model-specific mapping and disables a profile when no mapping is verified.
+An empty conversation may change provider/model; after its first message, the
+pair is immutable and a different selection starts a new conversation.
+
+Every explicit send makes at most one provider attempt. Automatic retries are
+prohibited because an interrupted or hidden attempt may already have consumed
+tokens. An origin, model, request field, stream parser, usage mapping, timeout,
+or profile change requires contract verification plus specification, privacy,
+architecture, threat, and test updates before implementation.
+
+### Usage, balance, and account actions
+
+The Usage ledger is local advisory state over the trailing seven days. Provider
+metadata is normalized into non-cached input, cached input, output, and total
+tokens. Missing fields remain visibly partial. The optional weekly token budget
+is per provider, never blocks a request, and is not a credit or billing value.
+The UI reports 10% remaining or less with red styling plus explicit text and an
+icon.
+
+DeepSeek balance refresh is a separate, explicit read-only call and the result
+is not persisted. Other providers direct the user to their account website.
+Account management takes only a typed provider/action pair; Rust selects the
+fixed official HTTPS page and opens the default browser. Do not accept a URL,
+model ID, path, or command from React for this operation. Aster never purchases
+credits or changes a plan.
+
+### Database migration
+
+Schema v2 adds the immutable provider/model pair and normalized usage ledger.
+The v1-to-v2 migration runs transactionally: existing conversations become
+`zai` / `glm-5.1`, and an old total-token value remains a total with an incomplete
+breakdown. Test successful migration, rollback on failure, restart behavior, and
+legacy import before changing the schema. Never delete or recreate a user's
+database to make a migration pass.
 
 ### Dependencies
 

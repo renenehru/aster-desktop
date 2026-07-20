@@ -1,20 +1,22 @@
-use std::io;
+mod schema;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::limits::Limit;
-use rusqlite::types::Type;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, params};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use uuid::Uuid;
 
+use crate::api::validate_selection;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    Conversation, ConversationSummary, ImportBundle, Message, MessageRole, MessageStatus,
-    ProviderMessage, ReasoningMode,
+    AdvisoryBudget, Conversation, ConversationSummary, ImportBundle, ImportBundleV1,
+    ImportBundleV2, MAX_SAFE_INTEGER, Message, MessageFinishReason, MessageRole, MessageStatus,
+    ProviderId, ProviderMessage, ResponseProfile, TokenUsage, UsageSummary,
 };
 
-pub const MODEL: &str = "glm-5.1";
+pub const DEFAULT_PROVIDER: ProviderId = ProviderId::Zai;
+pub const DEFAULT_MODEL: &str = "glm-5.1";
 const DEFAULT_TITLE: &str = "New conversation";
 const MAX_TITLE_CHARS: usize = 80;
 const MAX_USER_MESSAGE_BYTES: usize = 256 * 1024;
@@ -24,47 +26,6 @@ const MAX_PROVIDER_HISTORY_MESSAGES: usize = 200;
 const MAX_IMPORT_CONVERSATIONS: usize = 100;
 const MAX_IMPORT_MESSAGES: usize = 10_000;
 const MAX_MESSAGES_PER_CONVERSATION: usize = 10_000;
-const MAX_TOKEN_USAGE: u64 = i64::MAX as u64;
-const MAX_SQLITE_VALUE_BYTES: i32 = 3 * 1024 * 1024;
-
-const CONNECTION_PRAGMAS: &str = r#"
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
-PRAGMA secure_delete = ON;
-PRAGMA trusted_schema = OFF;
-PRAGMA temp_store = MEMORY;
-"#;
-
-const MIGRATION_1: &str = r#"
-CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY NOT NULL,
-    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 256),
-    model TEXT NOT NULL CHECK(model = 'glm-5.1'),
-    reasoning_mode TEXT NOT NULL CHECK(reasoning_mode IN ('fast', 'standard', 'deep')),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY NOT NULL,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL CHECK(position >= 0),
-    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-    content TEXT NOT NULL CHECK(length(content) <= 2097152),
-    token_usage INTEGER CHECK(token_usage IS NULL OR token_usage >= 0),
-    created_at TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('complete', 'cancelled', 'error')),
-    UNIQUE(conversation_id, position)
-) STRICT;
-
-CREATE INDEX IF NOT EXISTS idx_conversations_updated
-    ON conversations(updated_at DESC, id);
-CREATE INDEX IF NOT EXISTS idx_messages_conversation_position
-    ON messages(conversation_id, position);
-
-PRAGMA user_version = 1;
-"#;
 
 #[derive(Clone)]
 pub struct Database {
@@ -73,55 +34,22 @@ pub struct Database {
 
 pub struct PreparedGeneration {
     pub history: Vec<ProviderMessage>,
-    pub reasoning_mode: ReasoningMode,
+    pub provider_id: ProviderId,
+    pub model_id: String,
+    pub response_profile: ResponseProfile,
 }
 
 impl Database {
     pub fn open(path: &Path) -> AppResult<Self> {
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        Self::initialize(connection)
+        Ok(Self {
+            connection: Arc::new(Mutex::new(schema::open_path(path)?)),
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn open_in_memory() -> AppResult<Self> {
-        Self::initialize(Connection::open_in_memory()?)
-    }
-
-    fn initialize(mut connection: Connection) -> AppResult<Self> {
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        configure_sqlite_limits(&connection)?;
-        connection.execute_batch(CONNECTION_PRAGMAS)?;
-        let schema_version: u32 =
-            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match schema_version {
-            0 => {
-                let transaction = connection.transaction()?;
-                transaction.execute_batch(MIGRATION_1)?;
-                transaction.commit()?;
-            }
-            1 => {}
-            _ => return Err(AppError::DatabaseIntegrity),
-        }
-        verify_schema(&mut connection)?;
-        let integrity: String =
-            connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-        if integrity != "ok" {
-            return Err(AppError::DatabaseIntegrity);
-        }
-        let has_foreign_key_violation = {
-            let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
-            statement.query([])?.next()?.is_some()
-        };
-        if has_foreign_key_violation {
-            return Err(AppError::DatabaseIntegrity);
-        }
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(Mutex::new(schema::open_memory()?)),
         })
     }
 
@@ -129,37 +57,98 @@ impl Database {
         self.connection.lock().map_err(|_| AppError::Internal)
     }
 
-    pub fn create_conversation(&self, title: Option<String>) -> AppResult<Conversation> {
+    pub fn create_conversation(
+        &self,
+        title: Option<String>,
+        provider_id: Option<ProviderId>,
+        model_id: Option<String>,
+    ) -> AppResult<Conversation> {
+        let (provider_id, model_id) = match (provider_id, model_id) {
+            (None, None) => (DEFAULT_PROVIDER, DEFAULT_MODEL.to_owned()),
+            (Some(provider), Some(model)) => {
+                validate_selection(provider, &model)?;
+                (provider, model)
+            }
+            _ => {
+                return Err(AppError::Validation(
+                    "Provider and model must be supplied together.",
+                ));
+            }
+        };
         let title = normalize_title(title.as_deref().unwrap_or(DEFAULT_TITLE))?;
         let id = Uuid::new_v4().to_string();
         let now = now_utc();
         self.lock()?.execute(
             "INSERT INTO conversations
-             (id, title, model, reasoning_mode, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id, title, MODEL, ReasoningMode::Standard.as_str(), now],
+             (id,title,provider_id,model_id,response_profile,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?6)",
+            params![
+                id,
+                title,
+                provider_id.as_str(),
+                model_id,
+                ResponseProfile::Standard.as_str(),
+                now
+            ],
         )?;
         self.get_conversation(&id)
+    }
+
+    pub fn update_conversation_selection(
+        &self,
+        conversation_id: &str,
+        provider_id: ProviderId,
+        model_id: String,
+    ) -> AppResult<Conversation> {
+        validate_uuid(conversation_id, "Conversation ID is invalid.")?;
+        validate_selection(provider_id, &model_id)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT provider_id,model_id,
+                        (SELECT COUNT(*) FROM messages WHERE conversation_id=conversations.id)
+                 FROM conversations WHERE id=?1",
+                [conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(AppError::NotFound("Conversation not found."))?;
+        if current.0 == provider_id.as_str() && current.1 == model_id {
+            transaction.commit()?;
+            drop(connection);
+            return self.get_conversation(conversation_id);
+        }
+        if current.2 != 0 {
+            return Err(AppError::ConversationModelLocked);
+        }
+        transaction.execute(
+            "UPDATE conversations SET provider_id=?1,model_id=?2,updated_at=?3 WHERE id=?4",
+            params![provider_id.as_str(), model_id, now_utc(), conversation_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_conversation(conversation_id)
     }
 
     pub fn list_conversations(&self) -> AppResult<Vec<ConversationSummary>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT length(CAST(c.id AS BLOB)), length(CAST(c.title AS BLOB)),
-                    length(CAST(c.model AS BLOB)), length(CAST(c.reasoning_mode AS BLOB)),
-                    length(CAST(c.created_at AS BLOB)), length(CAST(c.updated_at AS BLOB)),
-                    c.id, c.title, c.model, c.reasoning_mode, c.created_at, c.updated_at, COUNT(m.id)
-             FROM conversations c
-             LEFT JOIN messages m ON m.conversation_id = c.id
-             GROUP BY c.id
-             ORDER BY c.updated_at DESC, c.id DESC",
+            "SELECT c.id,c.title,c.provider_id,c.model_id,c.response_profile,c.created_at,c.updated_at,
+                    COUNT(m.id)
+             FROM conversations c LEFT JOIN messages m ON m.conversation_id=c.id
+             GROUP BY c.id ORDER BY c.updated_at DESC,c.id DESC",
         )?;
-        let mut rows = statement.query([])?;
-        let mut conversations = Vec::new();
-        while let Some(row) = rows.next()? {
-            conversations.push(summary_from_row(row)?);
-        }
-        Ok(conversations)
+        statement
+            .query_map([], summary_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn get_conversation(&self, conversation_id: &str) -> AppResult<Conversation> {
@@ -174,33 +163,27 @@ impl Database {
         maximum_serialized_bytes: usize,
     ) -> AppResult<Conversation> {
         validate_uuid(conversation_id, "Conversation ID is invalid.")?;
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
-        ensure_conversation_exists(&transaction, conversation_id)?;
-        let (message_count, content_bytes): (i64, i64) = transaction.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(length(CAST(content AS BLOB))), 0)
-             FROM messages WHERE conversation_id = ?1",
+        let connection = self.lock()?;
+        let (count, bytes): (i64, i64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(content AS BLOB))),0)
+             FROM messages WHERE conversation_id=?1",
             [conversation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let message_count =
-            usize::try_from(message_count).map_err(|_| AppError::Database(invalid_db_value(0)))?;
-        let content_bytes =
-            usize::try_from(content_bytes).map_err(|_| AppError::Database(invalid_db_value(1)))?;
-        let estimated_bytes = 4_096usize
-            .checked_add(content_bytes)
-            .and_then(|value| value.checked_add(message_count.checked_mul(512)?))
+        let count = usize::try_from(count).map_err(|_| AppError::DatabaseIntegrity)?;
+        let bytes = usize::try_from(bytes).map_err(|_| AppError::DatabaseIntegrity)?;
+        let estimate = 4_096usize
+            .checked_add(bytes)
+            .and_then(|value| value.checked_add(count.checked_mul(640)?))
             .ok_or(AppError::Validation(
                 "The conversation export exceeds the 32 MiB limit.",
             ))?;
-        if estimated_bytes > maximum_serialized_bytes {
+        if estimate > maximum_serialized_bytes {
             return Err(AppError::Validation(
                 "The conversation export exceeds the 32 MiB limit.",
             ));
         }
-        let conversation = conversation_from_connection(&transaction, conversation_id)?;
-        transaction.commit()?;
-        Ok(conversation)
+        conversation_from_connection(&connection, conversation_id)
     }
 
     pub fn rename_conversation(
@@ -211,7 +194,7 @@ impl Database {
         validate_uuid(conversation_id, "Conversation ID is invalid.")?;
         let title = normalize_title(&title)?;
         let changed = self.lock()?.execute(
-            "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE conversations SET title=?1,updated_at=?2 WHERE id=?3",
             params![title, now_utc(), conversation_id],
         )?;
         if changed == 0 {
@@ -224,7 +207,7 @@ impl Database {
         validate_uuid(conversation_id, "Conversation ID is invalid.")?;
         let changed = self
             .lock()?
-            .execute("DELETE FROM conversations WHERE id = ?1", [conversation_id])?;
+            .execute("DELETE FROM conversations WHERE id=?1", [conversation_id])?;
         if changed == 0 {
             return Err(AppError::NotFound("Conversation not found."));
         }
@@ -242,10 +225,10 @@ impl Database {
         if let Some(message_id) = regenerate_from_message_id {
             validate_uuid(message_id, "Message ID is invalid.")?;
         }
-        let exists = self.lock()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+        let exists: bool = self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1)",
             [conversation_id],
-            |row| row.get::<_, bool>(0),
+            |row| row.get(0),
         )?;
         if !exists {
             return Err(AppError::NotFound("Conversation not found."));
@@ -253,22 +236,43 @@ impl Database {
         Ok(())
     }
 
-    pub fn prepare_generation(
+    pub fn prepare_generation<T>(
         &self,
+        operation_id: &str,
         conversation_id: &str,
         content: String,
-        reasoning_mode: ReasoningMode,
+        response_profile: ResponseProfile,
         regenerate_from_message_id: Option<String>,
-    ) -> AppResult<PreparedGeneration> {
-        validate_uuid(conversation_id, "Conversation ID is invalid.")?;
-        validate_message_content(&content, MAX_USER_MESSAGE_BYTES)?;
-        if let Some(message_id) = regenerate_from_message_id.as_deref() {
-            validate_uuid(message_id, "Message ID is invalid.")?;
-        }
-
+        pre_network: impl FnOnce(&PreparedGeneration) -> AppResult<T>,
+    ) -> AppResult<(PreparedGeneration, T)> {
+        validate_uuid(operation_id, "Operation ID is invalid.")?;
+        self.validate_generation_request(
+            conversation_id,
+            &content,
+            regenerate_from_message_id.as_deref(),
+        )?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        ensure_conversation_exists(&transaction, conversation_id)?;
+        let operation_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage_observations WHERE operation_id=?1)",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        if operation_exists {
+            return Err(AppError::Conflict(
+                "This generation request has already been started.",
+            ));
+        }
+        let (provider, model): (String, String) = transaction
+            .query_row(
+                "SELECT provider_id,model_id FROM conversations WHERE id=?1",
+                [conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(AppError::NotFound("Conversation not found."))?;
+        let provider_id = ProviderId::parse(&provider).ok_or(AppError::DatabaseIntegrity)?;
+        validate_selection(provider_id, &model).map_err(|_| AppError::DatabaseIntegrity)?;
 
         match regenerate_from_message_id.as_deref() {
             None => insert_new_user_message(&transaction, conversation_id, &content)?,
@@ -276,62 +280,128 @@ impl Database {
                 revise_or_regenerate(&transaction, conversation_id, message_id, &content)?
             }
         }
-        let persisted_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
             [conversation_id],
             |row| row.get(0),
         )?;
-        if persisted_count < 0 || persisted_count as usize >= MAX_MESSAGES_PER_CONVERSATION {
+        if count < 0 || count as usize >= MAX_MESSAGES_PER_CONVERSATION {
             return Err(AppError::Validation(
                 "This conversation has reached the 10000-message limit.",
             ));
         }
-
         transaction.execute(
-            "UPDATE conversations
-             SET reasoning_mode = ?1, updated_at = ?2
-             WHERE id = ?3",
-            params![reasoning_mode.as_str(), now_utc(), conversation_id],
+            "UPDATE conversations SET response_profile=?1,updated_at=?2 WHERE id=?3",
+            params![response_profile.as_str(), now_utc(), conversation_id],
         )?;
         maybe_derive_title(&transaction, conversation_id)?;
         let history = provider_history(&transaction, conversation_id)?;
-        if history.is_empty() || history.last().is_none_or(|m| m.role != MessageRole::User) {
+        if history.is_empty()
+            || history
+                .last()
+                .is_none_or(|message| message.role != MessageRole::User)
+        {
             return Err(AppError::Validation(
                 "Generation requires a persisted user message.",
             ));
         }
-        transaction.commit()?;
-        Ok(PreparedGeneration {
+        let prepared = PreparedGeneration {
             history,
-            reasoning_mode,
-        })
+            provider_id,
+            model_id: model,
+            response_profile,
+        };
+        let pre_network_result = pre_network(&prepared)?;
+        transaction.execute(
+            "INSERT INTO usage_observations
+             (operation_id,provider_id,model_id,observed_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,partial)
+             VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL,1)",
+            params![
+                operation_id,
+                prepared.provider_id.as_str(),
+                prepared.model_id,
+                now_utc()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((prepared, pre_network_result))
     }
 
-    pub fn append_assistant_message(
+    #[cfg(test)]
+    pub fn begin_usage_observation(
         &self,
+        operation_id: &str,
+        provider_id: ProviderId,
+        model_id: &str,
+    ) -> AppResult<()> {
+        validate_uuid(operation_id, "Operation ID is invalid.")?;
+        validate_selection(provider_id, model_id)?;
+        self.lock()?.execute(
+            "INSERT INTO usage_observations
+             (operation_id,provider_id,model_id,observed_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,partial)
+             VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL,1)",
+            params![operation_id, provider_id.as_str(), model_id, now_utc()],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn complete_usage_observation(
+        &self,
+        operation_id: &str,
+        usage: &TokenUsage,
+    ) -> AppResult<()> {
+        validate_uuid(operation_id, "Operation ID is invalid.")?;
+        usage.validate()?;
+        if usage.is_empty() {
+            return Err(AppError::Validation("Token usage is empty."));
+        }
+        let connection = self.lock()?;
+        finalize_usage_record(&connection, operation_id, Some(usage), &now_utc())
+    }
+
+    pub fn persist_generation_terminal(
+        &self,
+        operation_id: &str,
         conversation_id: &str,
         content: String,
         status: MessageStatus,
-        token_usage: Option<u64>,
+        finish_reason: Option<MessageFinishReason>,
+        usage: Option<TokenUsage>,
     ) -> AppResult<Message> {
+        validate_uuid(operation_id, "Operation ID is invalid.")?;
         validate_uuid(conversation_id, "Conversation ID is invalid.")?;
         match status {
             MessageStatus::Complete => {
                 validate_message_content(&content, MAX_STORED_MESSAGE_BYTES)?;
+                if !matches!(
+                    finish_reason,
+                    Some(MessageFinishReason::Stop | MessageFinishReason::OutputLimit)
+                ) {
+                    return Err(AppError::Validation(
+                        "A completed provider response requires a verified finish reason.",
+                    ));
+                }
             }
             MessageStatus::Cancelled | MessageStatus::Error => {
                 validate_terminal_content(&content, MAX_STORED_MESSAGE_BYTES)?;
+                if usage.is_some() || finish_reason.is_some() {
+                    return Err(AppError::Validation(
+                        "Cancelled or failed messages cannot store usage or a finish reason.",
+                    ));
+                }
             }
         }
-        let token_usage = token_usage
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| AppError::Validation("Token usage is out of range."))?;
+        if let Some(usage) = &usage {
+            usage.validate()?;
+        }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
+        let completed_at = now_utc();
+        finalize_usage_record(&transaction, operation_id, usage.as_ref(), &completed_at)?;
         ensure_conversation_exists(&transaction, conversation_id)?;
         let position: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM messages WHERE conversation_id = ?1",
+            "SELECT COALESCE(MAX(position)+1,0) FROM messages WHERE conversation_id=?1",
             [conversation_id],
             |row| row.get(0),
         )?;
@@ -341,105 +411,315 @@ impl Database {
             ));
         }
         let message = Message {
-            id: Uuid::new_v4().to_string(),
+            // Reusing the opaque operation identity makes terminal persistence
+            // idempotent even when authoritative usage is absent: a duplicate
+            // message insert fails and rolls the observation update back in
+            // this same transaction without adding ledger-only state.
+            id: operation_id.to_owned(),
             conversation_id: conversation_id.to_owned(),
             role: MessageRole::Assistant,
             content,
-            created_at: now_utc(),
+            created_at: completed_at,
             status,
-            token_usage: token_usage.map(|value| value as u64),
+            finish_reason,
+            usage,
         };
+        let usage = message.usage.as_ref();
         transaction.execute(
             "INSERT INTO messages
-             (id, conversation_id, position, role, content, token_usage, created_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id,conversation_id,position,role,content,input_tokens,cached_input_tokens,output_tokens,total_tokens,created_at,status,finish_reason)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 message.id,
                 message.conversation_id,
                 position,
                 message.role.as_str(),
                 message.content,
-                token_usage,
+                to_sql_token(usage.and_then(|value| value.input_tokens))?,
+                to_sql_token(usage.and_then(|value| value.cached_input_tokens))?,
+                to_sql_token(usage.and_then(|value| value.output_tokens))?,
+                to_sql_token(usage.and_then(|value| value.total_tokens))?,
                 message.created_at,
-                message.status.as_str()
+                message.status.as_str(),
+                message.finish_reason.map(MessageFinishReason::as_str)
             ],
         )?;
         transaction.execute(
-            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            "UPDATE conversations SET updated_at=?1 WHERE id=?2",
             params![message.created_at, conversation_id],
         )?;
         transaction.commit()?;
         Ok(message)
     }
 
+    pub fn acknowledge_notice(
+        &self,
+        provider_id: ProviderId,
+        notice_version: u32,
+    ) -> AppResult<()> {
+        if notice_version == 0 || notice_version > i64::MAX as u32 {
+            return Err(AppError::Validation("Provider notice version is invalid."));
+        }
+        self.lock()?.execute(
+            "INSERT INTO provider_preferences(provider_id,weekly_token_budget,notice_version)
+             VALUES(?1,NULL,?2)
+             ON CONFLICT(provider_id) DO UPDATE SET notice_version=excluded.notice_version",
+            params![provider_id.as_str(), i64::from(notice_version)],
+        )?;
+        Ok(())
+    }
+
+    pub fn notice_acknowledged(
+        &self,
+        provider_id: ProviderId,
+        notice_version: u32,
+    ) -> AppResult<bool> {
+        let stored = self
+            .lock()?
+            .query_row(
+                "SELECT notice_version FROM provider_preferences WHERE provider_id=?1",
+                [provider_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(stored == Some(i64::from(notice_version)))
+    }
+
+    pub fn set_usage_budget(
+        &self,
+        provider_id: ProviderId,
+        token_budget: Option<u64>,
+    ) -> AppResult<()> {
+        let token_budget = token_budget
+            .map(|value| {
+                if value == 0 || value > MAX_SAFE_INTEGER {
+                    return Err(AppError::Validation(
+                        "The token budget must be a positive JavaScript-safe integer.",
+                    ));
+                }
+                i64::try_from(value)
+                    .map_err(|_| AppError::Validation("Token budget is out of range."))
+            })
+            .transpose()?;
+        self.lock()?.execute(
+            "INSERT INTO provider_preferences(provider_id,weekly_token_budget,notice_version)
+             VALUES(?1,?2,0)
+             ON CONFLICT(provider_id) DO UPDATE SET weekly_token_budget=excluded.weekly_token_budget",
+            params![provider_id.as_str(), token_budget],
+        )?;
+        Ok(())
+    }
+
+    pub fn usage_summary(
+        &self,
+        provider_id: ProviderId,
+        model_id: Option<&str>,
+    ) -> AppResult<UsageSummary> {
+        self.usage_summary_at(provider_id, model_id, Utc::now())
+    }
+
+    fn usage_summary_at(
+        &self,
+        provider_id: ProviderId,
+        model_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> AppResult<UsageSummary> {
+        if let Some(model) = model_id {
+            validate_selection(provider_id, model)?;
+        }
+        let start = now - Duration::days(7);
+        let window_start = canonical_utc(start);
+        let window_end = canonical_utc(now);
+        let connection = self.lock()?;
+        validate_usage_ledger(&connection)?;
+        let mut statement = connection.prepare(
+            "SELECT input_tokens,cached_input_tokens,output_tokens,total_tokens,partial
+             FROM usage_observations
+             WHERE provider_id=?1 AND (?2 IS NULL OR model_id=?2)
+               AND observed_at>=?3 AND observed_at<=?4
+             ORDER BY observed_at,operation_id",
+        )?;
+        let mut rows = statement.query(params![
+            provider_id.as_str(),
+            model_id,
+            window_start,
+            window_end
+        ])?;
+        let mut input = Aggregate::default();
+        let mut cached = Aggregate::default();
+        let mut output = Aggregate::default();
+        let mut total = Aggregate::default();
+        let mut complete_observations = 0u64;
+        let mut partial_observations = 0u64;
+        while let Some(row) = rows.next()? {
+            input.add(row.get(0)?)?;
+            cached.add(row.get(1)?)?;
+            output.add(row.get(2)?)?;
+            total.add(row.get(3)?)?;
+            match row.get::<_, i64>(4)? {
+                0 => complete_observations = complete_observations.saturating_add(1),
+                1 => partial_observations = partial_observations.saturating_add(1),
+                _ => return Err(AppError::DatabaseIntegrity),
+            }
+        }
+        let overflow = input.overflow || cached.overflow || output.overflow || total.overflow;
+        if overflow {
+            partial_observations = partial_observations.saturating_add(1);
+        }
+        let budget_total = if model_id.is_some() {
+            let mut provider_total = Aggregate::default();
+            let mut statement = connection.prepare(
+                "SELECT total_tokens FROM usage_observations
+                 WHERE provider_id=?1 AND observed_at>=?2 AND observed_at<=?3
+                 ORDER BY observed_at,operation_id",
+            )?;
+            let mut rows =
+                statement.query(params![provider_id.as_str(), window_start, window_end])?;
+            while let Some(row) = rows.next()? {
+                provider_total.add(row.get(0)?)?;
+            }
+            provider_total
+        } else {
+            total.clone()
+        };
+        if budget_total.overflow && !overflow {
+            partial_observations = partial_observations.saturating_add(1);
+        }
+        let budget_value = connection
+            .query_row(
+                "SELECT weekly_token_budget FROM provider_preferences WHERE provider_id=?1",
+                [provider_id.as_str()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let budget = match budget_value {
+            Some(raw_budget) => {
+                let token_budget =
+                    u64::try_from(raw_budget).map_err(|_| AppError::DatabaseIntegrity)?;
+                if token_budget == 0 || token_budget > MAX_SAFE_INTEGER {
+                    return Err(AppError::DatabaseIntegrity);
+                }
+                let known_used =
+                    (!budget_total.overflow).then(|| budget_total.value().unwrap_or(0));
+                let remaining = known_used
+                    .map(|value| token_budget.saturating_sub(value))
+                    .unwrap_or(0);
+                let state = if known_used.is_none() || remaining == 0 {
+                    "exhausted"
+                } else if remaining <= token_budget / 10 {
+                    "low"
+                } else {
+                    "normal"
+                };
+                Some(AdvisoryBudget {
+                    token_budget,
+                    known_used_tokens: known_used,
+                    remaining_tokens: remaining,
+                    remaining_percentage: if known_used.is_none() {
+                        0.0
+                    } else {
+                        (remaining as f64 / token_budget as f64) * 100.0
+                    },
+                    state,
+                })
+            }
+            _ => None,
+        };
+        let mut usage = TokenUsage {
+            input_tokens: input.value(),
+            cached_input_tokens: cached.value(),
+            output_tokens: output.value(),
+            total_tokens: total.value(),
+        };
+        if usage.validate().is_err() {
+            usage.total_tokens = None;
+            partial_observations = partial_observations.saturating_add(1);
+        }
+        let coverage = if complete_observations == 0 && partial_observations == 0 {
+            "empty"
+        } else if partial_observations == 0 {
+            "complete"
+        } else {
+            "partial"
+        };
+        Ok(UsageSummary {
+            provider_id,
+            model_id: model_id.map(str::to_owned),
+            window_start,
+            window_end: window_end.clone(),
+            observed_at: window_end,
+            usage,
+            complete_observations,
+            partial_observations,
+            coverage,
+            budget,
+        })
+    }
+
     pub fn import(&self, bundle: ImportBundle) -> AppResult<Vec<ConversationSummary>> {
-        validate_import_header(&bundle)?;
-        let total_messages =
-            bundle
-                .conversations
-                .iter()
-                .try_fold(0usize, |total, conversation| {
-                    total
-                        .checked_add(conversation.messages.len())
-                        .ok_or(AppError::Validation(
-                            "The import contains too many messages.",
-                        ))
-                })?;
+        let normalized = normalize_import(bundle)?;
+        let total_messages = normalized.iter().try_fold(0usize, |total, conversation| {
+            total
+                .checked_add(conversation.messages.len())
+                .ok_or(AppError::Validation(
+                    "The import contains too many messages.",
+                ))
+        })?;
+        if normalized.is_empty() || normalized.len() > MAX_IMPORT_CONVERSATIONS {
+            return Err(AppError::Validation(
+                "The import must contain between 1 and 100 conversations.",
+            ));
+        }
         if total_messages > MAX_IMPORT_MESSAGES {
             return Err(AppError::Validation(
                 "The import contains more than 10000 messages.",
             ));
         }
-
-        validate_import_conversations(&bundle)?;
+        validate_normalized_import(&normalized)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let mut imported_ids = Vec::with_capacity(bundle.conversations.len());
-
-        for conversation in bundle.conversations {
-            let new_conversation_id = Uuid::new_v4().to_string();
-            let title = normalize_title(&conversation.title)?;
-            let conversation_created_at = normalize_timestamp(&conversation.created_at)?;
-            let conversation_updated_at = normalize_timestamp(&conversation.updated_at)?;
+        let mut imported_ids = Vec::with_capacity(normalized.len());
+        for conversation in normalized {
+            let conversation_id = Uuid::new_v4().to_string();
             transaction.execute(
                 "INSERT INTO conversations
-                 (id, title, model, reasoning_mode, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (id,title,provider_id,model_id,response_profile,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
-                    new_conversation_id,
-                    title,
-                    MODEL,
-                    conversation.reasoning_mode.as_str(),
-                    conversation_created_at,
-                    conversation_updated_at
+                    conversation_id,
+                    conversation.title,
+                    conversation.provider_id.as_str(),
+                    conversation.model_id,
+                    conversation.response_profile.as_str(),
+                    conversation.created_at,
+                    conversation.updated_at
                 ],
             )?;
             for (position, message) in conversation.messages.into_iter().enumerate() {
-                let token_usage = message
-                    .token_usage
-                    .map(i64::try_from)
-                    .transpose()
-                    .map_err(|_| AppError::Validation("Token usage is out of range."))?;
-                let message_created_at = normalize_timestamp(&message.created_at)?;
+                let usage = message.usage.as_ref();
                 transaction.execute(
                     "INSERT INTO messages
-                     (id, conversation_id, position, role, content, token_usage, created_at, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (id,conversation_id,position,role,content,input_tokens,cached_input_tokens,output_tokens,total_tokens,created_at,status,finish_reason)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     params![
                         Uuid::new_v4().to_string(),
-                        new_conversation_id,
+                        conversation_id,
                         position as i64,
                         message.role.as_str(),
                         message.content,
-                        token_usage,
-                        message_created_at,
-                        message.status.as_str()
+                        to_sql_token(usage.and_then(|value| value.input_tokens))?,
+                        to_sql_token(usage.and_then(|value| value.cached_input_tokens))?,
+                        to_sql_token(usage.and_then(|value| value.output_tokens))?,
+                        to_sql_token(usage.and_then(|value| value.total_tokens))?,
+                        message.created_at,
+                        message.status.as_str(),
+                        message.finish_reason.map(MessageFinishReason::as_str)
                     ],
                 )?;
             }
-            imported_ids.push(new_conversation_id);
+            imported_ids.push(conversation_id);
         }
-
         transaction.commit()?;
         drop(connection);
         imported_ids
@@ -452,299 +732,104 @@ impl Database {
     }
 }
 
-fn configure_sqlite_limits(connection: &Connection) -> AppResult<()> {
-    connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 128 * 1024)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_COLUMN, 64)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_EXPR_DEPTH, 64)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_COMPOUND_SELECT, 8)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_FUNCTION_ARG, 32)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, 256 * 1024)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 32)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_TRIGGER_DEPTH, 4)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_WORKER_THREADS, 0)?;
-    Ok(())
+#[derive(Clone, Default)]
+struct Aggregate {
+    seen: bool,
+    total: u64,
+    overflow: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ColumnDefinition {
-    name: String,
-    data_type: String,
-    not_null: bool,
-    primary_key: bool,
-    hidden: bool,
+impl Aggregate {
+    fn add(&mut self, value: Option<i64>) -> AppResult<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let value = u64::try_from(value).map_err(|_| AppError::DatabaseIntegrity)?;
+        if value > MAX_SAFE_INTEGER {
+            return Err(AppError::DatabaseIntegrity);
+        }
+        self.seen = true;
+        match self.total.checked_add(value) {
+            Some(sum) if sum <= MAX_SAFE_INTEGER => self.total = sum,
+            _ => self.overflow = true,
+        }
+        Ok(())
+    }
+
+    fn value(&self) -> Option<u64> {
+        (self.seen && !self.overflow).then_some(self.total)
+    }
 }
 
-fn verify_schema(connection: &mut Connection) -> AppResult<()> {
-    let objects = {
-        let mut statement = connection.prepare(
-            "SELECT type, name, tbl_name FROM sqlite_schema
-             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let expected_objects = vec![
-        (
-            "index".to_owned(),
-            "idx_conversations_updated".to_owned(),
-            "conversations".to_owned(),
-        ),
-        (
-            "index".to_owned(),
-            "idx_messages_conversation_position".to_owned(),
-            "messages".to_owned(),
-        ),
-        (
-            "table".to_owned(),
-            "conversations".to_owned(),
-            "conversations".to_owned(),
-        ),
-        (
-            "table".to_owned(),
-            "messages".to_owned(),
-            "messages".to_owned(),
-        ),
-    ];
-    if objects != expected_objects {
-        return Err(AppError::DatabaseIntegrity);
-    }
-
-    if table_columns(connection, "PRAGMA table_xinfo(conversations)")?
-        != expected_columns(&[
-            ("id", "TEXT", true, true),
-            ("title", "TEXT", true, false),
-            ("model", "TEXT", true, false),
-            ("reasoning_mode", "TEXT", true, false),
-            ("created_at", "TEXT", true, false),
-            ("updated_at", "TEXT", true, false),
-        ])
-        || table_columns(connection, "PRAGMA table_xinfo(messages)")?
-            != expected_columns(&[
-                ("id", "TEXT", true, true),
-                ("conversation_id", "TEXT", true, false),
-                ("position", "INTEGER", true, false),
-                ("role", "TEXT", true, false),
-                ("content", "TEXT", true, false),
-                ("token_usage", "INTEGER", false, false),
-                ("created_at", "TEXT", true, false),
-                ("status", "TEXT", true, false),
-            ])
-    {
-        return Err(AppError::DatabaseIntegrity);
-    }
-
-    verify_schema_sql(
-        connection,
-        "conversations",
-        &[
-            "check(length(title) between 1 and 256)",
-            "check(model = 'glm-5.1')",
-            "check(reasoning_mode in ('fast', 'standard', 'deep'))",
-        ],
-    )?;
-    verify_schema_sql(
-        connection,
-        "messages",
-        &[
-            "check(position >= 0)",
-            "check(role in ('user', 'assistant'))",
-            "check(length(content) <= 2097152)",
-            "check(token_usage is null or token_usage >= 0)",
-            "check(status in ('complete', 'cancelled', 'error'))",
-            "unique(conversation_id, position)",
-        ],
-    )?;
-
-    let foreign_keys = {
-        let mut statement = connection.prepare("PRAGMA foreign_key_list(messages)")?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if foreign_keys
-        != vec![(
-            "conversations".to_owned(),
-            "conversation_id".to_owned(),
-            "id".to_owned(),
-            "CASCADE".to_owned(),
-        )]
-    {
-        return Err(AppError::DatabaseIntegrity);
-    }
-    if index_columns(connection, "idx_conversations_updated")? != ["updated_at", "id"]
-        || index_columns(connection, "idx_messages_conversation_position")?
-            != ["conversation_id", "position"]
-    {
-        return Err(AppError::DatabaseIntegrity);
-    }
-    let unique_indexes = {
-        let mut statement = connection
-            .prepare("SELECT name FROM pragma_index_list('messages') WHERE \"unique\" = 1")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if !unique_indexes.into_iter().any(|name| {
-        index_columns(connection, &name)
-            .is_ok_and(|columns| columns == ["conversation_id", "position"])
-    }) {
-        return Err(AppError::DatabaseIntegrity);
-    }
-
-    verify_constraint_behavior(connection)
-}
-
-fn table_columns(connection: &Connection, pragma: &str) -> AppResult<Vec<ColumnDefinition>> {
-    let mut statement = connection.prepare(pragma)?;
-    let columns = statement
-        .query_map([], |row| {
-            Ok(ColumnDefinition {
-                name: row.get(1)?,
-                data_type: row.get(2)?,
-                not_null: row.get::<_, i64>(3)? == 1,
-                primary_key: row.get::<_, i64>(5)? == 1,
-                hidden: row.get::<_, i64>(6)? != 0,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns)
-}
-
-fn expected_columns(definitions: &[(&str, &str, bool, bool)]) -> Vec<ColumnDefinition> {
-    definitions
-        .iter()
-        .map(
-            |(name, data_type, not_null, primary_key)| ColumnDefinition {
-                name: (*name).to_owned(),
-                data_type: (*data_type).to_owned(),
-                not_null: *not_null,
-                primary_key: *primary_key,
-                hidden: false,
-            },
-        )
-        .collect()
-}
-
-fn verify_schema_sql(
+fn finalize_usage_record(
     connection: &Connection,
-    table: &str,
-    required_fragments: &[&str],
+    operation_id: &str,
+    usage: Option<&TokenUsage>,
+    completed_at: &str,
 ) -> AppResult<()> {
-    let sql: String = connection.query_row(
-        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-        [table],
-        |row| row.get(0),
-    )?;
-    let normalized = sql
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    if !normalized.ends_with("strict")
-        || required_fragments
-            .iter()
-            .any(|fragment| !normalized.contains(fragment))
-    {
-        return Err(AppError::DatabaseIntegrity);
+    let changed = if let Some(usage) = usage {
+        connection.execute(
+            "UPDATE usage_observations
+             SET observed_at=?1,input_tokens=?2,cached_input_tokens=?3,output_tokens=?4,total_tokens=?5,partial=?6
+             WHERE operation_id=?7
+               AND partial=1
+               AND input_tokens IS NULL
+               AND cached_input_tokens IS NULL
+               AND output_tokens IS NULL
+               AND total_tokens IS NULL",
+            params![
+                completed_at,
+                to_sql_token(usage.input_tokens)?,
+                to_sql_token(usage.cached_input_tokens)?,
+                to_sql_token(usage.output_tokens)?,
+                to_sql_token(usage.total_tokens)?,
+                i64::from(!usage.is_complete()),
+                operation_id
+            ],
+        )?
+    } else {
+        connection.execute(
+            "UPDATE usage_observations SET observed_at=?1
+             WHERE operation_id=?2",
+            params![completed_at, operation_id],
+        )?
+    };
+    if changed != 1 {
+        return Err(AppError::NotFound("The usage observation was not found."));
     }
     Ok(())
 }
 
-fn index_columns(connection: &Connection, index_name: &str) -> AppResult<Vec<String>> {
-    let mut statement =
-        connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
-    Ok(statement
-        .query_map([index_name], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-fn verify_constraint_behavior(connection: &mut Connection) -> AppResult<()> {
-    let transaction = connection.transaction()?;
-    let conversation_id = Uuid::new_v4().to_string();
-    let timestamp = "2026-01-01T00:00:00.000Z";
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO conversations VALUES (?1, '', ?2, 'standard', ?3, ?3)",
-        params![Uuid::new_v4().to_string(), MODEL, timestamp],
-    ))?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO conversations VALUES (?1, 'Probe', 'wrong-model', 'standard', ?2, ?2)",
-        params![Uuid::new_v4().to_string(), timestamp],
-    ))?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO conversations VALUES (?1, 'Probe', ?2, 'unsupported', ?3, ?3)",
-        params![Uuid::new_v4().to_string(), MODEL, timestamp],
-    ))?;
-    transaction.execute(
-        "INSERT INTO conversations VALUES (?1, 'Probe', ?2, 'standard', ?3, ?3)",
-        params![conversation_id, MODEL, timestamp],
+fn validate_usage_ledger(connection: &Connection) -> AppResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT operation_id,provider_id,model_id,observed_at,
+                input_tokens,cached_input_tokens,output_tokens,total_tokens,partial
+         FROM usage_observations ORDER BY operation_id",
     )?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO messages VALUES (?1, ?2, -1, 'user', 'x', NULL, ?3, 'complete')",
-        params![Uuid::new_v4().to_string(), conversation_id, timestamp],
-    ))?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO messages VALUES (?1, ?2, 0, 'system', 'x', NULL, ?3, 'complete')",
-        params![Uuid::new_v4().to_string(), conversation_id, timestamp],
-    ))?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO messages VALUES (?1, ?2, 0, 'user', 'x', -1, ?3, 'complete')",
-        params![Uuid::new_v4().to_string(), conversation_id, timestamp],
-    ))?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO messages VALUES (?1, ?2, 0, 'user', 'x', NULL, ?3, 'streaming')",
-        params![Uuid::new_v4().to_string(), conversation_id, timestamp],
-    ))?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO messages VALUES (?1, ?2, 0, 'user', 'x', NULL, ?3, 'complete')",
-        params![
-            Uuid::new_v4().to_string(),
-            Uuid::new_v4().to_string(),
-            timestamp
-        ],
-    ))?;
-    transaction.execute(
-        "INSERT INTO messages VALUES (?1, ?2, 0, 'user', 'x', NULL, ?3, 'complete')",
-        params![Uuid::new_v4().to_string(), conversation_id, timestamp],
-    )?;
-    expect_constraint_rejection(transaction.execute(
-        "INSERT INTO messages VALUES (?1, ?2, 0, 'assistant', 'x', NULL, ?3, 'complete')",
-        params![Uuid::new_v4().to_string(), conversation_id, timestamp],
-    ))?;
-    transaction.execute(
-        "DELETE FROM conversations WHERE id = ?1",
-        [&conversation_id],
-    )?;
-    let remaining: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
-        [&conversation_id],
-        |row| row.get(0),
-    )?;
-    if remaining != 0 {
-        return Err(AppError::DatabaseIntegrity);
-    }
-    transaction.rollback()?;
-    Ok(())
-}
-
-fn expect_constraint_rejection(result: rusqlite::Result<usize>) -> AppResult<()> {
-    if result.is_ok() {
-        return Err(AppError::DatabaseIntegrity);
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let operation_id: String = row.get(0)?;
+        let provider: String = row.get(1)?;
+        let model_id: String = row.get(2)?;
+        let observed_at: String = row.get(3)?;
+        let provider_id = ProviderId::parse(&provider).ok_or(AppError::DatabaseIntegrity)?;
+        if validate_uuid(&operation_id, "invalid").is_err()
+            || validate_selection(provider_id, &model_id).is_err()
+            || validate_stored_timestamp(&observed_at).is_none()
+        {
+            return Err(AppError::DatabaseIntegrity);
+        }
+        let usage = TokenUsage::new(
+            token_from_sql(row.get(4)?).map_err(|_| AppError::DatabaseIntegrity)?,
+            token_from_sql(row.get(5)?).map_err(|_| AppError::DatabaseIntegrity)?,
+            token_from_sql(row.get(6)?).map_err(|_| AppError::DatabaseIntegrity)?,
+            token_from_sql(row.get(7)?).map_err(|_| AppError::DatabaseIntegrity)?,
+        )
+        .map_err(|_| AppError::DatabaseIntegrity)?;
+        let partial: i64 = row.get(8)?;
+        if !matches!(partial, 0 | 1) || (partial == 0) != usage.is_complete() {
+            return Err(AppError::DatabaseIntegrity);
+        }
     }
     Ok(())
 }
@@ -753,10 +838,10 @@ fn ensure_conversation_exists(
     transaction: &Transaction<'_>,
     conversation_id: &str,
 ) -> AppResult<()> {
-    let exists = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1)",
         [conversation_id],
-        |row| row.get::<_, bool>(0),
+        |row| row.get(0),
     )?;
     if !exists {
         return Err(AppError::NotFound("Conversation not found."));
@@ -770,7 +855,7 @@ fn insert_new_user_message(
     content: &str,
 ) -> AppResult<()> {
     let position: i64 = transaction.query_row(
-        "SELECT COALESCE(MAX(position) + 1, 0) FROM messages WHERE conversation_id = ?1",
+        "SELECT COALESCE(MAX(position)+1,0) FROM messages WHERE conversation_id=?1",
         [conversation_id],
         |row| row.get(0),
     )?;
@@ -781,15 +866,9 @@ fn insert_new_user_message(
     }
     transaction.execute(
         "INSERT INTO messages
-         (id, conversation_id, position, role, content, token_usage, created_at, status)
-         VALUES (?1, ?2, ?3, 'user', ?4, NULL, ?5, 'complete')",
-        params![
-            Uuid::new_v4().to_string(),
-            conversation_id,
-            position,
-            content,
-            now_utc()
-        ],
+         (id,conversation_id,position,role,content,input_tokens,cached_input_tokens,output_tokens,total_tokens,created_at,status)
+         VALUES(?1,?2,?3,'user',?4,NULL,NULL,NULL,NULL,?5,'complete')",
+        params![Uuid::new_v4().to_string(), conversation_id, position, content, now_utc()],
     )?;
     Ok(())
 }
@@ -802,62 +881,51 @@ fn revise_or_regenerate(
 ) -> AppResult<()> {
     let target = transaction
         .query_row(
-            "SELECT length(CAST(role AS BLOB)), role, position FROM messages
-             WHERE id = ?1 AND conversation_id = ?2",
+            "SELECT role,position FROM messages WHERE id=?1 AND conversation_id=?2",
             params![message_id, conversation_id],
-            |row| {
-                let expected = bounded_row_length(row, 0, 16)?;
-                let role: String = row.get(1)?;
-                if role.len() != expected {
-                    return Err(invalid_db_value(1));
-                }
-                Ok((role, row.get::<_, i64>(2)?))
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
     let Some((role, position)) = target else {
         return Err(AppError::NotFound("Message not found."));
     };
-    let role = MessageRole::parse(&role).ok_or(AppError::Database(invalid_db_value(0)))?;
-
-    match role {
+    match MessageRole::parse(&role).ok_or(AppError::DatabaseIntegrity)? {
         MessageRole::User => {
             transaction.execute(
-                "DELETE FROM messages WHERE conversation_id = ?1 AND position > ?2",
+                "DELETE FROM messages WHERE conversation_id=?1 AND position>?2",
                 params![conversation_id, position],
             )?;
             transaction.execute(
-                "UPDATE messages SET content = ?1, status = 'complete'
-                 WHERE id = ?2 AND conversation_id = ?3",
+                "UPDATE messages SET content=?1,status='complete',input_tokens=NULL,
+                 cached_input_tokens=NULL,output_tokens=NULL,total_tokens=NULL
+                 WHERE id=?2 AND conversation_id=?3",
                 params![content, message_id, conversation_id],
             )?;
         }
         MessageRole::Assistant => {
-            let latest_position: i64 = transaction.query_row(
-                "SELECT MAX(position) FROM messages WHERE conversation_id = ?1",
+            let latest: i64 = transaction.query_row(
+                "SELECT MAX(position) FROM messages WHERE conversation_id=?1",
                 [conversation_id],
                 |row| row.get(0),
             )?;
-            if latest_position != position {
+            if latest != position {
                 return Err(AppError::Conflict(
                     "Only the most recent assistant response can be regenerated.",
                 ));
             }
-            let preceding_user_exists = transaction.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM messages
-                    WHERE conversation_id = ?1 AND role = 'user' AND position < ?2
-                 )",
+            let preceding: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages
+                 WHERE conversation_id=?1 AND role='user' AND position<?2)",
                 params![conversation_id, position],
-                |row| row.get::<_, bool>(0),
+                |row| row.get(0),
             )?;
-            if !preceding_user_exists {
+            if !preceding {
                 return Err(AppError::Validation(
                     "The assistant response has no preceding user message.",
                 ));
             }
             transaction.execute(
-                "DELETE FROM messages WHERE conversation_id = ?1 AND position >= ?2",
+                "DELETE FROM messages WHERE conversation_id=?1 AND position>=?2",
                 params![conversation_id, position],
             )?;
         }
@@ -870,11 +938,9 @@ fn provider_history(
     conversation_id: &str,
 ) -> AppResult<Vec<ProviderMessage>> {
     let mut statement = transaction.prepare(
-        "SELECT length(CAST(role AS BLOB)), length(CAST(content AS BLOB)), role, content
-         FROM messages WHERE conversation_id = ?1
-           AND (role = 'user' OR (role = 'assistant' AND status = 'complete'))
-         ORDER BY position DESC
-         LIMIT ?2",
+        "SELECT role,content FROM messages WHERE conversation_id=?1
+           AND (role='user' OR (role='assistant' AND status='complete'))
+         ORDER BY position DESC LIMIT ?2",
     )?;
     let mut rows = statement.query(params![
         conversation_id,
@@ -883,22 +949,17 @@ fn provider_history(
     let mut reversed = Vec::new();
     let mut total_bytes = 0usize;
     while let Some(row) = rows.next()? {
-        let role_bytes = bounded_row_length(row, 0, 16)?;
-        let content_bytes = bounded_row_length(row, 1, MAX_STORED_MESSAGE_BYTES)?;
-        let next_size = total_bytes.saturating_add(content_bytes);
-        if next_size > MAX_PROVIDER_HISTORY_BYTES {
-            break;
-        }
-        let role: String = row.get(2)?;
-        let content: String = row.get(3)?;
-        if role.len() != role_bytes || content.len() != content_bytes {
-            return Err(AppError::DatabaseIntegrity);
-        }
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
         validate_message_content(&content, MAX_STORED_MESSAGE_BYTES)
             .map_err(|_| AppError::DatabaseIntegrity)?;
-        total_bytes = next_size;
+        let next = total_bytes.saturating_add(content.len());
+        if next > MAX_PROVIDER_HISTORY_BYTES {
+            break;
+        }
+        total_bytes = next;
         reversed.push(ProviderMessage {
-            role: MessageRole::parse(&role).ok_or(AppError::Database(invalid_db_value(0)))?,
+            role: MessageRole::parse(&role).ok_or(AppError::DatabaseIntegrity)?,
             content,
         });
     }
@@ -908,39 +969,22 @@ fn provider_history(
 
 fn maybe_derive_title(transaction: &Transaction<'_>, conversation_id: &str) -> AppResult<()> {
     let title: String = transaction.query_row(
-        "SELECT length(CAST(title AS BLOB)), title FROM conversations WHERE id = ?1",
+        "SELECT title FROM conversations WHERE id=?1",
         [conversation_id],
-        |row| {
-            let expected = bounded_row_length(row, 0, MAX_TITLE_CHARS * 4)?;
-            let title: String = row.get(1)?;
-            if title.len() != expected || normalize_title(&title).is_err() {
-                return Err(invalid_db_value(1));
-            }
-            Ok(title)
-        },
+        |row| row.get(0),
     )?;
     if title != DEFAULT_TITLE && title != "New chat" {
         return Ok(());
     }
-    let first_user_content: Option<String> = transaction
+    let content = transaction
         .query_row(
-            "SELECT length(CAST(content AS BLOB)), content FROM messages
-             WHERE conversation_id = ?1 AND role = 'user'
-             ORDER BY position ASC LIMIT 1",
+            "SELECT content FROM messages WHERE conversation_id=?1 AND role='user'
+             ORDER BY position LIMIT 1",
             [conversation_id],
-            |row| {
-                let expected = bounded_row_length(row, 0, MAX_USER_MESSAGE_BYTES)?;
-                let content: String = row.get(1)?;
-                if content.len() != expected
-                    || validate_message_content(&content, MAX_USER_MESSAGE_BYTES).is_err()
-                {
-                    return Err(invalid_db_value(1));
-                }
-                Ok(content)
-            },
+            |row| row.get::<_, String>(0),
         )
         .optional()?;
-    if let Some(content) = first_user_content {
+    if let Some(content) = content {
         let derived = content
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -950,7 +994,7 @@ fn maybe_derive_title(transaction: &Transaction<'_>, conversation_id: &str) -> A
             .collect::<String>();
         if !derived.is_empty() {
             transaction.execute(
-                "UPDATE conversations SET title = ?1 WHERE id = ?2",
+                "UPDATE conversations SET title=?1 WHERE id=?2",
                 params![derived, conversation_id],
             )?;
         }
@@ -964,23 +1008,18 @@ fn conversation_from_connection(
 ) -> AppResult<Conversation> {
     let summary = connection
         .query_row(
-            "SELECT length(CAST(c.id AS BLOB)), length(CAST(c.title AS BLOB)),
-                    length(CAST(c.model AS BLOB)), length(CAST(c.reasoning_mode AS BLOB)),
-                    length(CAST(c.created_at AS BLOB)), length(CAST(c.updated_at AS BLOB)),
-                    c.id, c.title, c.model, c.reasoning_mode, c.created_at, c.updated_at,
-                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)
-             FROM conversations c WHERE c.id = ?1",
+            "SELECT c.id,c.title,c.provider_id,c.model_id,c.response_profile,c.created_at,c.updated_at,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id)
+             FROM conversations c WHERE c.id=?1",
             [conversation_id],
             summary_from_row,
         )
         .optional()?
         .ok_or(AppError::NotFound("Conversation not found."))?;
     let mut statement = connection.prepare(
-        "SELECT position, length(CAST(id AS BLOB)), length(CAST(conversation_id AS BLOB)),
-                length(CAST(role AS BLOB)), length(CAST(content AS BLOB)),
-                length(CAST(created_at AS BLOB)), length(CAST(status AS BLOB)),
-                id, conversation_id, role, content, created_at, status, token_usage
-         FROM messages WHERE conversation_id = ?1 ORDER BY position ASC",
+        "SELECT position,id,conversation_id,role,content,input_tokens,cached_input_tokens,
+                output_tokens,total_tokens,created_at,status,finish_reason
+         FROM messages WHERE conversation_id=?1 ORDER BY position",
     )?;
     let mut rows = statement.query([conversation_id])?;
     let mut messages = Vec::new();
@@ -994,8 +1033,9 @@ fn conversation_from_connection(
     Ok(Conversation {
         id: summary.id,
         title: summary.title,
-        model: summary.model,
-        reasoning_mode: summary.reasoning_mode,
+        provider_id: summary.provider_id,
+        model_id: summary.model_id,
+        response_profile: summary.response_profile,
         created_at: summary.created_at,
         updated_at: summary.updated_at,
         message_count: summary.message_count,
@@ -1004,87 +1044,79 @@ fn conversation_from_connection(
 }
 
 fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ConversationSummary> {
-    let id_bytes = bounded_row_length(row, 0, 36)?;
-    let title_bytes = bounded_row_length(row, 1, MAX_TITLE_CHARS * 4)?;
-    let model_bytes = bounded_row_length(row, 2, MODEL.len())?;
-    let reasoning_bytes = bounded_row_length(row, 3, 16)?;
-    let created_bytes = bounded_row_length(row, 4, 64)?;
-    let updated_bytes = bounded_row_length(row, 5, 64)?;
-    let id: String = row.get(6)?;
-    let title: String = row.get(7)?;
-    let model: String = row.get(8)?;
-    let reasoning: String = row.get(9)?;
-    let created_at: String = row.get(10)?;
-    let updated_at: String = row.get(11)?;
-    let message_count: i64 = row.get(12)?;
-    if id.len() != id_bytes
-        || title.len() != title_bytes
-        || model.len() != model_bytes
-        || reasoning.len() != reasoning_bytes
-        || created_at.len() != created_bytes
-        || updated_at.len() != updated_bytes
-        || validate_uuid(&id, "invalid").is_err()
+    let id: String = row.get(0)?;
+    let title: String = row.get(1)?;
+    let provider: String = row.get(2)?;
+    let model_id: String = row.get(3)?;
+    let profile: String = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    let updated_at: String = row.get(6)?;
+    let message_count: i64 = row.get(7)?;
+    let provider_id = ProviderId::parse(&provider).ok_or_else(invalid_db_value)?;
+    if validate_uuid(&id, "invalid").is_err()
         || normalize_title(&title).is_err()
-        || model != MODEL
-    {
-        return Err(invalid_db_value(0));
-    }
-    let created = validate_stored_timestamp(&created_at).ok_or_else(|| invalid_db_value(10))?;
-    let updated = validate_stored_timestamp(&updated_at).ok_or_else(|| invalid_db_value(11))?;
-    if updated < created
+        || validate_selection(provider_id, &model_id).is_err()
+        || validate_stored_timestamp(&created_at).is_none()
+        || validate_stored_timestamp(&updated_at).is_none()
         || message_count < 0
         || message_count as usize > MAX_MESSAGES_PER_CONVERSATION
     {
-        return Err(invalid_db_value(12));
+        return Err(invalid_db_value());
     }
     Ok(ConversationSummary {
         id,
         title,
-        model,
-        reasoning_mode: ReasoningMode::parse(&reasoning).ok_or_else(|| invalid_db_value(3))?,
+        provider_id,
+        model_id,
+        response_profile: ResponseProfile::parse(&profile).ok_or_else(invalid_db_value)?,
         created_at,
         updated_at,
-        message_count: u64::try_from(message_count).map_err(|_| invalid_db_value(6))?,
+        message_count: message_count as u64,
     })
 }
 
-fn message_from_row(row: &Row<'_>, expected_conversation_id: &str) -> rusqlite::Result<Message> {
-    let id_bytes = bounded_row_length(row, 1, 36)?;
-    let conversation_id_bytes = bounded_row_length(row, 2, 36)?;
-    let role_bytes = bounded_row_length(row, 3, 16)?;
-    let content_bytes = bounded_row_length(row, 4, MAX_STORED_MESSAGE_BYTES)?;
-    let created_bytes = bounded_row_length(row, 5, 64)?;
-    let status_bytes = bounded_row_length(row, 6, 16)?;
-    let id: String = row.get(7)?;
-    let conversation_id: String = row.get(8)?;
-    let role: String = row.get(9)?;
-    let content: String = row.get(10)?;
-    let created_at: String = row.get(11)?;
-    let status: String = row.get(12)?;
-    let token_usage: Option<i64> = row.get(13)?;
-    if id.len() != id_bytes
-        || conversation_id.len() != conversation_id_bytes
-        || role.len() != role_bytes
-        || content.len() != content_bytes
-        || created_at.len() != created_bytes
-        || status.len() != status_bytes
-        || conversation_id != expected_conversation_id
+fn message_from_row(row: &Row<'_>, expected_conversation_id: &str) -> AppResult<Message> {
+    let id: String = row.get(1)?;
+    let conversation_id: String = row.get(2)?;
+    let role: String = row.get(3)?;
+    let content: String = row.get(4)?;
+    let input = token_from_sql(row.get(5)?).map_err(|_| AppError::DatabaseIntegrity)?;
+    let cached = token_from_sql(row.get(6)?).map_err(|_| AppError::DatabaseIntegrity)?;
+    let output = token_from_sql(row.get(7)?).map_err(|_| AppError::DatabaseIntegrity)?;
+    let total = token_from_sql(row.get(8)?).map_err(|_| AppError::DatabaseIntegrity)?;
+    let created_at: String = row.get(9)?;
+    let status: String = row.get(10)?;
+    let finish_reason: Option<String> = row.get(11)?;
+    if conversation_id != expected_conversation_id
         || validate_uuid(&id, "invalid").is_err()
         || validate_uuid(&conversation_id, "invalid").is_err()
         || validate_stored_timestamp(&created_at).is_none()
     {
-        return Err(invalid_db_value(0));
+        return Err(AppError::DatabaseIntegrity);
     }
-    let role = MessageRole::parse(&role).ok_or_else(|| invalid_db_value(9))?;
-    let status = MessageStatus::parse(&status).ok_or_else(|| invalid_db_value(12))?;
-    let content_valid = match status {
+    let role = MessageRole::parse(&role).ok_or(AppError::DatabaseIntegrity)?;
+    let status = MessageStatus::parse(&status).ok_or(AppError::DatabaseIntegrity)?;
+    let finish_reason = match finish_reason.as_deref() {
+        Some(value) => Some(MessageFinishReason::parse(value).ok_or(AppError::DatabaseIntegrity)?),
+        None => None,
+    };
+    let content_result = match status {
         MessageStatus::Complete => validate_message_content(&content, MAX_STORED_MESSAGE_BYTES),
         MessageStatus::Cancelled | MessageStatus::Error => {
             validate_terminal_content(&content, MAX_STORED_MESSAGE_BYTES)
         }
     };
-    if content_valid.is_err() || (role == MessageRole::User && status != MessageStatus::Complete) {
-        return Err(invalid_db_value(10));
+    if content_result.is_err()
+        || (role == MessageRole::User && status != MessageStatus::Complete)
+        || ((role == MessageRole::Assistant && status == MessageStatus::Complete)
+            != finish_reason.is_some())
+    {
+        return Err(AppError::DatabaseIntegrity);
+    }
+    let usage =
+        TokenUsage::new(input, cached, output, total).map_err(|_| AppError::DatabaseIntegrity)?;
+    if !usage.is_empty() && !(role == MessageRole::Assistant && status == MessageStatus::Complete) {
+        return Err(AppError::DatabaseIntegrity);
     }
     Ok(Message {
         id,
@@ -1093,41 +1125,157 @@ fn message_from_row(row: &Row<'_>, expected_conversation_id: &str) -> rusqlite::
         content,
         created_at,
         status,
-        token_usage: token_usage
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| invalid_db_value(6))?,
+        finish_reason,
+        usage: (!usage.is_empty()).then_some(usage),
     })
 }
 
-fn validate_import_header(bundle: &ImportBundle) -> AppResult<()> {
-    if bundle.format != "aster-conversation" || bundle.version != 1 {
+struct NormalizedConversation {
+    title: String,
+    provider_id: ProviderId,
+    model_id: String,
+    response_profile: ResponseProfile,
+    created_at: String,
+    updated_at: String,
+    messages: Vec<NormalizedMessage>,
+}
+
+struct NormalizedMessage {
+    role: MessageRole,
+    content: String,
+    created_at: String,
+    status: MessageStatus,
+    finish_reason: Option<MessageFinishReason>,
+    usage: Option<TokenUsage>,
+}
+
+fn normalize_import(bundle: ImportBundle) -> AppResult<Vec<NormalizedConversation>> {
+    match bundle {
+        ImportBundle::V1(bundle) => normalize_v1(bundle),
+        ImportBundle::V2(bundle) => normalize_v2(bundle),
+    }
+}
+
+fn normalize_v1(bundle: ImportBundleV1) -> AppResult<Vec<NormalizedConversation>> {
+    validate_import_header(&bundle.format, bundle.version, &bundle.exported_at, 1)?;
+    bundle
+        .conversations
+        .into_iter()
+        .map(|conversation| {
+            if conversation.model != DEFAULT_MODEL {
+                return Err(AppError::Validation(
+                    "The version 1 import uses an unsupported model.",
+                ));
+            }
+            let messages = conversation
+                .messages
+                .into_iter()
+                .map(|message| {
+                    let finish_reason = (message.role == MessageRole::Assistant
+                        && message.status == MessageStatus::Complete)
+                        .then_some(MessageFinishReason::Unknown);
+                    let usage = message
+                        .token_usage
+                        .map(|total| TokenUsage::new(None, None, None, Some(total)))
+                        .transpose()?;
+                    Ok(NormalizedMessage {
+                        role: message.role,
+                        content: message.content,
+                        created_at: normalize_timestamp(&message.created_at)?,
+                        status: message.status,
+                        finish_reason,
+                        usage,
+                    })
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            Ok(NormalizedConversation {
+                title: normalize_title(&conversation.title)?,
+                provider_id: DEFAULT_PROVIDER,
+                model_id: DEFAULT_MODEL.to_owned(),
+                response_profile: conversation.reasoning_mode,
+                created_at: normalize_timestamp(&conversation.created_at)?,
+                updated_at: normalize_timestamp(&conversation.updated_at)?,
+                messages,
+            })
+        })
+        .collect()
+}
+
+fn normalize_v2(bundle: ImportBundleV2) -> AppResult<Vec<NormalizedConversation>> {
+    validate_import_header(&bundle.format, bundle.version, &bundle.exported_at, 2)?;
+    bundle
+        .conversations
+        .into_iter()
+        .map(|conversation| {
+            validate_selection(conversation.provider_id, &conversation.model_id)?;
+            let messages = conversation
+                .messages
+                .into_iter()
+                .map(|message| {
+                    if let Some(usage) = &message.usage {
+                        usage.validate()?;
+                    }
+                    let finish_reason = if message.role == MessageRole::Assistant
+                        && message.status == MessageStatus::Complete
+                    {
+                        Some(
+                            message
+                                .finish_reason
+                                .unwrap_or(MessageFinishReason::Unknown),
+                        )
+                    } else {
+                        message.finish_reason
+                    };
+                    Ok(NormalizedMessage {
+                        role: message.role,
+                        content: message.content,
+                        created_at: normalize_timestamp(&message.created_at)?,
+                        status: message.status,
+                        finish_reason,
+                        usage: message.usage,
+                    })
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            Ok(NormalizedConversation {
+                title: normalize_title(&conversation.title)?,
+                provider_id: conversation.provider_id,
+                model_id: conversation.model_id,
+                response_profile: conversation.response_profile,
+                created_at: normalize_timestamp(&conversation.created_at)?,
+                updated_at: normalize_timestamp(&conversation.updated_at)?,
+                messages,
+            })
+        })
+        .collect()
+}
+
+fn validate_import_header(
+    format: &str,
+    version: u32,
+    exported_at: &str,
+    expected_version: u32,
+) -> AppResult<()> {
+    if format != "aster-conversation" || version != expected_version {
         return Err(AppError::Validation(
             "The import format or schema version is not supported.",
         ));
     }
-    validate_timestamp(&bundle.exported_at)?;
-    if bundle.conversations.is_empty() || bundle.conversations.len() > MAX_IMPORT_CONVERSATIONS {
-        return Err(AppError::Validation(
-            "The import must contain between 1 and 100 conversations.",
-        ));
-    }
-    Ok(())
+    validate_timestamp(exported_at)
 }
 
-fn validate_import_conversations(bundle: &ImportBundle) -> AppResult<()> {
-    for conversation in &bundle.conversations {
-        normalize_title(&conversation.title)?;
-        let created_at = parse_timestamp(&conversation.created_at)?;
-        let updated_at = parse_timestamp(&conversation.updated_at)?;
-        if updated_at < created_at {
+fn validate_normalized_import(conversations: &[NormalizedConversation]) -> AppResult<()> {
+    for conversation in conversations {
+        validate_selection(conversation.provider_id, &conversation.model_id)?;
+        let created = parse_timestamp(&conversation.created_at)?;
+        let updated = parse_timestamp(&conversation.updated_at)?;
+        if updated < created {
             return Err(AppError::Validation(
                 "An imported conversation update timestamp precedes its creation timestamp.",
             ));
         }
-        if conversation.model != MODEL {
+        if conversation.messages.len() > MAX_MESSAGES_PER_CONVERSATION {
             return Err(AppError::Validation(
-                "The import uses a model that this Aster version does not support.",
+                "An imported conversation has too many messages.",
             ));
         }
         for message in &conversation.messages {
@@ -1145,11 +1293,28 @@ fn validate_import_conversations(bundle: &ImportBundle) -> AppResult<()> {
                     "Imported user messages must have complete status.",
                 ));
             }
-            if message
-                .token_usage
-                .is_some_and(|usage| usage > MAX_TOKEN_USAGE)
+            if (message.role == MessageRole::Assistant && message.status == MessageStatus::Complete)
+                != message.finish_reason.is_some()
             {
-                return Err(AppError::Validation("Token usage is out of range."));
+                return Err(AppError::Validation(
+                    "Imported finish reasons are allowed only on complete assistant messages.",
+                ));
+            }
+            if message.usage.is_some()
+                && (message.role != MessageRole::Assistant
+                    || message.status != MessageStatus::Complete)
+            {
+                return Err(AppError::Validation(
+                    "Imported token usage is allowed only on complete assistant messages.",
+                ));
+            }
+            if let Some(usage) = &message.usage {
+                usage.validate()?;
+                if usage.is_empty() {
+                    return Err(AppError::Validation(
+                        "Imported token usage must contain at least one known count.",
+                    ));
+                }
             }
         }
     }
@@ -1171,25 +1336,15 @@ fn normalize_title(value: &str) -> AppResult<String> {
     Ok(title.to_owned())
 }
 
-fn validate_message_content(content: &str, max_bytes: usize) -> AppResult<()> {
+fn validate_message_content(content: &str, maximum: usize) -> AppResult<()> {
     if content.trim().is_empty() {
         return Err(AppError::Validation("Message content cannot be empty."));
     }
-    if content.len() > max_bytes {
-        return Err(AppError::Validation("Message content is too large."));
-    }
-    if content.chars().any(|character| {
-        character == '\0' || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
-    }) {
-        return Err(AppError::Validation(
-            "Message content contains unsupported control characters.",
-        ));
-    }
-    Ok(())
+    validate_terminal_content(content, maximum)
 }
 
-fn validate_terminal_content(content: &str, max_bytes: usize) -> AppResult<()> {
-    if content.len() > max_bytes {
+fn validate_terminal_content(content: &str, maximum: usize) -> AppResult<()> {
+    if content.len() > maximum {
         return Err(AppError::Validation("Message content is too large."));
     }
     if content.chars().any(|character| {
@@ -1204,7 +1359,7 @@ fn validate_terminal_content(content: &str, max_bytes: usize) -> AppResult<()> {
 
 fn validate_uuid(value: &str, message: &'static str) -> AppResult<()> {
     let parsed = Uuid::parse_str(value).map_err(|_| AppError::Validation(message))?;
-    if parsed.to_string() != value.to_ascii_lowercase() {
+    if parsed.to_string() != value {
         return Err(AppError::Validation(message));
     }
     Ok(())
@@ -1223,9 +1378,7 @@ fn parse_timestamp(value: &str) -> AppResult<DateTime<chrono::FixedOffset>> {
 }
 
 fn normalize_timestamp(value: &str) -> AppResult<String> {
-    Ok(parse_timestamp(value)?
-        .with_timezone(&Utc)
-        .to_rfc3339_opts(SecondsFormat::Millis, true))
+    Ok(canonical_utc(parse_timestamp(value)?.with_timezone(&Utc)))
 }
 
 fn validate_stored_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -1234,176 +1387,347 @@ fn validate_stored_timestamp(value: &str) -> Option<DateTime<Utc>> {
         return None;
     }
     let utc = parsed.with_timezone(&Utc);
-    if utc.to_rfc3339_opts(SecondsFormat::Millis, true) != value {
-        return None;
-    }
-    Some(utc)
+    (canonical_utc(utc) == value).then_some(utc)
+}
+
+fn canonical_utc(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn now_utc() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    canonical_utc(Utc::now())
 }
 
-fn invalid_db_value(index: usize) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        index,
-        Type::Text,
-        Box::new(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "database value violates the application schema",
-        )),
-    )
+fn to_sql_token(value: Option<u64>) -> AppResult<Option<i64>> {
+    value
+        .map(|value| {
+            if value > MAX_SAFE_INTEGER {
+                return Err(AppError::Validation("Token usage is out of range."));
+            }
+            i64::try_from(value).map_err(|_| AppError::Validation("Token usage is out of range."))
+        })
+        .transpose()
 }
 
-fn bounded_row_length(row: &Row<'_>, index: usize, maximum: usize) -> rusqlite::Result<usize> {
-    let length: i64 = row.get(index)?;
-    let length = usize::try_from(length).map_err(|_| invalid_db_value(index))?;
-    if length > maximum {
-        return Err(invalid_db_value(index));
-    }
-    Ok(length)
+fn token_from_sql(value: Option<i64>) -> rusqlite::Result<Option<u64>> {
+    value
+        .map(|value| {
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value <= MAX_SAFE_INTEGER)
+                .ok_or_else(invalid_db_value)
+        })
+        .transpose()
+}
+
+fn invalid_db_value() -> rusqlite::Error {
+    rusqlite::Error::InvalidQuery
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ProviderClient;
+    use chrono::TimeZone;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
 
-    fn database() -> Database {
-        Database::open_in_memory().expect("test database should open")
+    #[test]
+    fn v1_migration_uses_backup_and_preserves_only_legacy_total_on_message() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("aster.sqlite3");
+        let legacy = Connection::open(&path).expect("legacy database");
+        legacy
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")
+            .unwrap();
+        schema::v1_schema_for_tests(&legacy).expect("v1 schema");
+        let conversation_id = Uuid::new_v4().to_string();
+        let message_id = Uuid::new_v4().to_string();
+        let timestamp = "2026-07-13T10:00:00.000Z";
+        legacy
+            .execute(
+                "INSERT INTO conversations VALUES(?1,'Legacy','glm-5.1','deep',?2,?2)",
+                params![conversation_id, timestamp],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO messages VALUES(?1,?2,0,'assistant','Legacy answer',42,?3,'complete')",
+                params![message_id, conversation_id, timestamp],
+            )
+            .unwrap();
+
+        let database = Database::open(&path).expect("migration should succeed");
+        let conversation = database.get_conversation(&conversation_id).unwrap();
+        assert_eq!(conversation.provider_id, ProviderId::Zai);
+        assert_eq!(conversation.model_id, "glm-5.1");
+        assert_eq!(conversation.response_profile, ResponseProfile::Deep);
+        assert_eq!(
+            conversation.messages[0].usage,
+            Some(TokenUsage::total_only(42))
+        );
+        assert_eq!(
+            conversation.messages[0].finish_reason,
+            Some(MessageFinishReason::Unknown)
+        );
+        let summary = database.usage_summary(ProviderId::Zai, None).unwrap();
+        assert_eq!(summary.coverage, "empty");
+        assert!(
+            !path
+                .with_file_name("aster.sqlite3.v1-backup.sqlite3")
+                .exists()
+        );
     }
 
     #[test]
-    fn conversation_crud_and_messages_are_persistent() {
-        let database = database();
-        let conversation = database
-            .create_conversation(None)
-            .expect("conversation should be created");
-        let prepared = database
-            .prepare_generation(
-                &conversation.id,
-                "Review this threat model.".to_owned(),
-                ReasoningMode::Deep,
-                None,
-            )
-            .expect("generation should be prepared");
-        assert_eq!(prepared.history.len(), 1);
-        assert_eq!(prepared.reasoning_mode, ReasoningMode::Deep);
+    fn conflicting_backup_blocks_migration_without_mutating_v1() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("aster.sqlite3");
+        let legacy = Connection::open(&path).unwrap();
+        schema::v1_schema_for_tests(&legacy).unwrap();
+        std::fs::write(
+            path.with_file_name("aster.sqlite3.v1-backup.sqlite3"),
+            b"not sqlite",
+        )
+        .unwrap();
+        assert!(Database::open(&path).is_err());
+        let version: u32 = legacy
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+    }
 
-        database
-            .append_assistant_message(
+    #[test]
+    fn invalid_v1_title_timestamp_and_status_retain_backup_and_original() {
+        for case in ["title", "timestamp", "status"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("aster.sqlite3");
+            let legacy = Connection::open(&path).unwrap();
+            schema::v1_schema_for_tests(&legacy).unwrap();
+            let conversation_id = Uuid::new_v4().to_string();
+            let message_id = Uuid::new_v4().to_string();
+            let title = if case == "title" {
+                "x".repeat(MAX_TITLE_CHARS + 1)
+            } else {
+                "Legacy".to_owned()
+            };
+            let timestamp = if case == "timestamp" {
+                "not-a-timestamp"
+            } else {
+                "2026-07-13T10:00:00.000Z"
+            };
+            let (role, status, token_usage) = if case == "status" {
+                ("user", "cancelled", None)
+            } else {
+                ("assistant", "complete", Some(42_i64))
+            };
+            legacy
+                .execute(
+                    "INSERT INTO conversations VALUES(?1,?2,'glm-5.1','standard',?3,?3)",
+                    params![conversation_id, title, timestamp],
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO messages VALUES(?1,?2,0,?3,'Legacy content',?4,?5,?6)",
+                    params![
+                        message_id,
+                        conversation_id,
+                        role,
+                        token_usage,
+                        timestamp,
+                        status
+                    ],
+                )
+                .unwrap();
+            let expected: (String, String, String, String) = legacy
+                .query_row(
+                    "SELECT c.title,c.created_at,m.role,m.status
+                     FROM conversations c JOIN messages m ON m.conversation_id=c.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            drop(legacy);
+
+            assert!(Database::open(&path).is_err(), "case {case}");
+            let backup_path = path.with_file_name("aster.sqlite3.v1-backup.sqlite3");
+            assert!(backup_path.exists(), "case {case}");
+            for candidate in [&path, &backup_path] {
+                let connection = Connection::open(candidate).unwrap();
+                let version: u32 = connection
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(version, 1, "case {case}");
+                let actual: (String, String, String, String) = connection
+                    .query_row(
+                        "SELECT c.title,c.created_at,m.role,m.status
+                         FROM conversations c JOIN messages m ON m.conversation_id=c.id",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected, "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn provider_pair_is_mutable_only_while_conversation_is_empty() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let updated = database
+            .update_conversation_selection(
                 &conversation.id,
-                "Start with assets and trust boundaries.".to_owned(),
-                MessageStatus::Complete,
-                Some(42),
+                ProviderId::Google,
+                "gemini-2.5-pro".to_owned(),
             )
-            .expect("assistant message should be stored");
-        let loaded = database
-            .get_conversation(&conversation.id)
-            .expect("conversation should load");
-        assert_eq!(loaded.messages.len(), 2);
-        assert_eq!(loaded.reasoning_mode, ReasoningMode::Deep);
-        assert_eq!(loaded.title, "Review this threat model.");
+            .unwrap();
+        assert_eq!(updated.provider_id, ProviderId::Google);
+        database
+            .prepare_generation(
+                &Uuid::new_v4().to_string(),
+                &conversation.id,
+                "Hello".to_owned(),
+                ResponseProfile::Fast,
+                None,
+                |_| Ok(()),
+            )
+            .unwrap();
         assert!(matches!(
-            database.get_conversation_for_export(&conversation.id, 64),
-            Err(AppError::Validation(_))
+            database.update_conversation_selection(
+                &conversation.id,
+                ProviderId::Zai,
+                "glm-5.2".to_owned()
+            ),
+            Err(AppError::ConversationModelLocked)
         ));
+    }
+
+    #[test]
+    fn usage_observation_is_single_fill_and_survives_conversation_deletion() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let operation_id = Uuid::new_v4().to_string();
+        database
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        let partial = database
+            .usage_summary(ProviderId::Zai, Some("glm-5.1"))
+            .unwrap();
+        assert_eq!(partial.partial_observations, 1);
+        let usage = TokenUsage::new(Some(8), Some(2), Some(30), Some(40)).unwrap();
+        database
+            .complete_usage_observation(&operation_id, &usage)
+            .unwrap();
         assert!(
             database
-                .get_conversation_for_export(&conversation.id, 1024 * 1024)
-                .is_ok()
+                .complete_usage_observation(&operation_id, &usage)
+                .is_err()
         );
-
-        database
-            .rename_conversation(&conversation.id, "Security review".to_owned())
-            .expect("rename should work");
-        assert_eq!(database.list_conversations().expect("list").len(), 1);
-        database
-            .delete_conversation(&conversation.id)
-            .expect("delete should work");
-        assert!(database.list_conversations().expect("list").is_empty());
+        database.delete_conversation(&conversation.id).unwrap();
+        let current = database.usage_summary(ProviderId::Zai, None).unwrap();
+        assert_eq!(current.usage.total_tokens, Some(40));
+        assert_eq!(current.complete_observations, 1);
     }
 
     #[test]
-    fn editing_a_user_message_removes_all_descendants_atomically() {
-        let database = database();
-        let conversation = database.create_conversation(None).expect("create");
+    fn terminal_message_and_usage_finalization_commit_atomically() {
+        let database = Database::open_in_memory().unwrap();
+        let operation_id = Uuid::new_v4().to_string();
         database
-            .prepare_generation(
-                &conversation.id,
-                "First prompt".to_owned(),
-                ReasoningMode::Standard,
-                None,
-            )
-            .expect("prepare");
-        database
-            .append_assistant_message(
-                &conversation.id,
-                "First answer".to_owned(),
-                MessageStatus::Complete,
-                None,
-            )
-            .expect("append");
-        database
-            .prepare_generation(
-                &conversation.id,
-                "Second prompt".to_owned(),
-                ReasoningMode::Standard,
-                None,
-            )
-            .expect("prepare");
-        let before = database.get_conversation(&conversation.id).expect("load");
-        let first_user_id = before.messages[0].id.clone();
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        let usage = TokenUsage::new(Some(8), Some(2), Some(30), Some(40)).unwrap();
+        assert!(
+            database
+                .persist_generation_terminal(
+                    &operation_id,
+                    &Uuid::new_v4().to_string(),
+                    "Answer".to_owned(),
+                    MessageStatus::Complete,
+                    Some(MessageFinishReason::Stop),
+                    Some(usage.clone()),
+                )
+                .is_err()
+        );
+        let after_rollback = database.usage_summary(ProviderId::Zai, None).unwrap();
+        assert_eq!(after_rollback.partial_observations, 1);
+        assert_eq!(after_rollback.usage.total_tokens, None);
 
-        let prepared = database
-            .prepare_generation(
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let message = database
+            .persist_generation_terminal(
+                &operation_id,
                 &conversation.id,
-                "Revised first prompt".to_owned(),
-                ReasoningMode::Fast,
-                Some(first_user_id),
+                "Answer".to_owned(),
+                MessageStatus::Complete,
+                Some(MessageFinishReason::Stop),
+                Some(usage.clone()),
             )
-            .expect("revision");
-        assert_eq!(prepared.history.len(), 1);
-        assert_eq!(prepared.history[0].content, "Revised first prompt");
-        let after = database.get_conversation(&conversation.id).expect("load");
-        assert_eq!(after.messages.len(), 1);
+            .unwrap();
+        assert_eq!(message.usage, Some(usage.clone()));
+        assert!(
+            database
+                .persist_generation_terminal(
+                    &operation_id,
+                    &conversation.id,
+                    "Duplicate".to_owned(),
+                    MessageStatus::Complete,
+                    Some(MessageFinishReason::Stop),
+                    Some(usage),
+                )
+                .is_err()
+        );
+        let stored = database.get_conversation(&conversation.id).unwrap();
+        assert_eq!(stored.messages.len(), 1);
+        assert_eq!(
+            database
+                .usage_summary(ProviderId::Zai, None)
+                .unwrap()
+                .complete_observations,
+            1
+        );
     }
 
     #[test]
-    fn regenerating_latest_assistant_reuses_the_preceding_user_prompt() {
-        let database = database();
-        let conversation = database.create_conversation(None).expect("create");
+    fn null_usage_terminalization_is_explicit_and_idempotent() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let operation_id = Uuid::new_v4().to_string();
         database
-            .prepare_generation(
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        let message = database
+            .persist_generation_terminal(
+                &operation_id,
                 &conversation.id,
-                "Original prompt".to_owned(),
-                ReasoningMode::Standard,
+                "Partial answer".to_owned(),
+                MessageStatus::Cancelled,
+                None,
                 None,
             )
-            .expect("prepare");
-        let assistant = database
-            .append_assistant_message(
-                &conversation.id,
-                "Original answer".to_owned(),
-                MessageStatus::Complete,
-                None,
-            )
-            .expect("append");
-
-        let prepared = database
-            .prepare_generation(
-                &conversation.id,
-                "This caller content is not duplicated".to_owned(),
-                ReasoningMode::Deep,
-                Some(assistant.id),
-            )
-            .expect("regenerate");
-        assert_eq!(prepared.history.len(), 1);
-        assert_eq!(prepared.history[0].role, MessageRole::User);
-        assert_eq!(prepared.history[0].content, "Original prompt");
+            .unwrap();
+        assert_eq!(message.finish_reason, None);
+        assert!(message.usage.is_none());
+        assert_eq!(message.id, operation_id);
+        assert!(
+            database
+                .persist_generation_terminal(
+                    &operation_id,
+                    &conversation.id,
+                    "Duplicate".to_owned(),
+                    MessageStatus::Cancelled,
+                    None,
+                    None,
+                )
+                .is_err()
+        );
         assert_eq!(
             database
                 .get_conversation(&conversation.id)
-                .expect("load")
+                .unwrap()
                 .messages
                 .len(),
             1
@@ -1411,247 +1735,620 @@ mod tests {
     }
 
     #[test]
-    fn invalid_regeneration_history_rolls_back_descendant_deletion() {
-        let database = database();
-        let conversation = database.create_conversation(None).expect("create");
-        database
-            .prepare_generation(
-                &conversation.id,
-                "Prompt".to_owned(),
-                ReasoningMode::Standard,
-                None,
-            )
-            .expect("prepare");
-        database
-            .append_assistant_message(
-                &conversation.id,
-                "First adjacent assistant".to_owned(),
-                MessageStatus::Complete,
-                None,
-            )
-            .expect("append first");
-        let latest = database
-            .append_assistant_message(
-                &conversation.id,
-                "Second adjacent assistant".to_owned(),
-                MessageStatus::Complete,
-                None,
-            )
-            .expect("append second");
-        assert!(
-            database
-                .prepare_generation(
-                    &conversation.id,
-                    "Ignored".to_owned(),
-                    ReasoningMode::Standard,
-                    Some(latest.id.clone()),
-                )
-                .is_err()
-        );
-        let after = database.get_conversation(&conversation.id).expect("load");
-        assert_eq!(after.messages.len(), 3);
-        assert_eq!(after.messages[2].id, latest.id);
-
-        let oversized = "x".repeat(MAX_PROVIDER_HISTORY_BYTES + 1);
-        let second = database.create_conversation(None).expect("create second");
-        database
-            .prepare_generation(
-                &second.id,
-                "Prompt".to_owned(),
-                ReasoningMode::Standard,
-                None,
-            )
-            .expect("prepare second");
-        database
-            .append_assistant_message(&second.id, oversized, MessageStatus::Complete, None)
-            .expect("append oversized");
-        let latest = database
-            .append_assistant_message(
-                &second.id,
-                "Latest".to_owned(),
-                MessageStatus::Complete,
-                None,
-            )
-            .expect("append latest");
-        assert!(
-            database
-                .prepare_generation(
-                    &second.id,
-                    "Ignored".to_owned(),
-                    ReasoningMode::Standard,
-                    Some(latest.id.clone()),
-                )
-                .is_err()
-        );
-        let after = database.get_conversation(&second.id).expect("load second");
-        assert_eq!(after.messages.len(), 3);
-        assert_eq!(after.messages[2].id, latest.id);
-    }
-
-    #[test]
-    fn invalid_import_does_not_commit_partial_data() {
-        let database = database();
-        let malformed = ImportBundle {
-            format: "aster-conversation".to_owned(),
-            version: 1,
-            exported_at: "2026-07-11T00:00:00Z".to_owned(),
-            conversations: vec![crate::models::ImportConversation {
-                title: "Imported".to_owned(),
-                model: MODEL.to_owned(),
-                reasoning_mode: ReasoningMode::Standard,
-                created_at: "not-a-timestamp".to_owned(),
-                updated_at: "2026-07-11T00:00:00Z".to_owned(),
-                messages: Vec::new(),
-            }],
-        };
-        assert!(database.import(malformed).is_err());
-        assert!(database.list_conversations().expect("list").is_empty());
-    }
-
-    #[test]
-    fn valid_import_generates_new_ids_and_normalizes_timestamps() {
-        let database = database();
-        let bundle = ImportBundle {
-            format: "aster-conversation".to_owned(),
-            version: 1,
-            exported_at: "2026-07-11T01:00:00+01:00".to_owned(),
-            conversations: vec![crate::models::ImportConversation {
-                title: "Imported".to_owned(),
-                model: MODEL.to_owned(),
-                reasoning_mode: ReasoningMode::Fast,
-                created_at: "2026-07-11T01:00:00+01:00".to_owned(),
-                updated_at: "2026-07-11T02:00:00+01:00".to_owned(),
-                messages: vec![crate::models::ImportMessage {
-                    role: MessageRole::User,
-                    content: "Imported prompt".to_owned(),
-                    created_at: "2026-07-11T01:30:00+01:00".to_owned(),
-                    status: MessageStatus::Complete,
-                    token_usage: None,
-                }],
-            }],
-        };
-        let imported = database.import(bundle).expect("valid import");
-        assert_eq!(imported.len(), 1);
-        assert!(Uuid::parse_str(&imported[0].id).is_ok());
-        assert_eq!(imported[0].created_at, "2026-07-11T00:00:00.000Z");
-        let conversation = database
-            .get_conversation(&imported[0].id)
-            .expect("imported conversation");
-        assert_eq!(conversation.messages.len(), 1);
-        assert!(Uuid::parse_str(&conversation.messages[0].id).is_ok());
+    fn usage_observation_schema_is_the_closed_normative_set() {
+        let database = Database::open_in_memory().unwrap();
+        let connection = database.lock().unwrap();
+        let mut statement = connection
+            .prepare("PRAGMA table_info(usage_observations)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(
-            conversation.messages[0].created_at,
-            "2026-07-11T00:30:00.000Z"
+            columns,
+            [
+                "operation_id",
+                "provider_id",
+                "model_id",
+                "observed_at",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "partial",
+            ]
         );
     }
 
     #[test]
-    fn newer_database_schema_is_rejected_without_replacement() {
-        let connection = Connection::open_in_memory().expect("open");
-        connection
-            .pragma_update(None, "user_version", 2)
-            .expect("set version");
-        assert!(matches!(
-            Database::initialize(connection),
-            Err(AppError::DatabaseIntegrity)
-        ));
-    }
-
-    #[test]
-    fn version_one_schema_with_weakened_constraints_is_rejected() {
-        let connection = Connection::open_in_memory().expect("open");
-        let weakened = MIGRATION_1.replace(
-            "CHECK(length(content) <= 2097152)",
-            "CHECK(length(content) <= 3145728)",
+    fn output_limit_finish_reason_persists_with_partial_content_and_usage() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let operation_id = Uuid::new_v4().to_string();
+        database
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        let usage = TokenUsage::new(Some(8), Some(2), Some(30), Some(40)).unwrap();
+        database
+            .persist_generation_terminal(
+                &operation_id,
+                &conversation.id,
+                "Response stopped at the provider output limit".to_owned(),
+                MessageStatus::Complete,
+                Some(MessageFinishReason::OutputLimit),
+                Some(usage.clone()),
+            )
+            .unwrap();
+        let stored = database.get_conversation(&conversation.id).unwrap();
+        assert_eq!(
+            stored.messages[0].finish_reason,
+            Some(MessageFinishReason::OutputLimit)
         );
-        connection
-            .execute_batch(&weakened)
-            .expect("weakened schema should be syntactically valid");
-        assert!(matches!(
-            Database::initialize(connection),
-            Err(AppError::DatabaseIntegrity)
-        ));
+        assert_eq!(stored.messages[0].usage, Some(usage));
+        let exported =
+            serde_json::to_value(crate::models::ExportConversation::from(stored)).unwrap();
+        assert_eq!(
+            exported["messages"][0]["finishReason"],
+            serde_json::json!("outputLimit")
+        );
     }
 
     #[test]
-    fn oversized_stored_content_is_rejected_before_content_is_read() {
-        let database = database();
-        let conversation = database.create_conversation(None).expect("conversation");
-        let oversized = "x".repeat(MAX_STORED_MESSAGE_BYTES + 1);
-        {
-            let connection = database.lock().expect("connection");
-            connection
-                .execute_batch("PRAGMA ignore_check_constraints = ON")
-                .expect("test-only constraint bypass");
-            connection
-                .execute(
-                    "INSERT INTO messages
-                     (id, conversation_id, position, role, content, token_usage, created_at, status)
-                     VALUES (?1, ?2, 0, 'assistant', ?3, NULL, ?4, 'complete')",
-                    params![
-                        Uuid::new_v4().to_string(),
-                        conversation.id,
-                        oversized,
-                        now_utc()
-                    ],
+    fn user_message_and_pre_network_usage_marker_commit_atomically() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let operation_id = Uuid::new_v4().to_string();
+        database
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        assert!(
+            database
+                .prepare_generation(
+                    &operation_id,
+                    &conversation.id,
+                    "Must roll back".to_owned(),
+                    ResponseProfile::Standard,
+                    None,
+                    |_| Ok(()),
                 )
-                .expect("test corruption should be inserted");
-        }
-        assert!(matches!(
-            database.get_conversation(&conversation.id),
-            Err(AppError::Database(_))
-        ));
+                .is_err()
+        );
+        assert!(
+            database
+                .get_conversation(&conversation.id)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
     }
 
     #[test]
-    fn malformed_stored_conversation_metadata_is_rejected_on_read() {
-        let database = database();
-        let conversation = database.create_conversation(None).expect("conversation");
-        {
-            let connection = database.lock().expect("connection");
-            connection
-                .execute_batch("PRAGMA ignore_check_constraints = ON")
-                .expect("test-only constraint bypass");
-            connection
-                .execute(
-                    "UPDATE conversations SET model = 'unsupported' WHERE id = ?1",
-                    [&conversation.id],
-                )
-                .expect("test corruption should be inserted");
-        }
-        assert!(matches!(
-            database.list_conversations(),
-            Err(AppError::Database(_))
-        ));
-    }
-
-    #[test]
-    fn preexisting_foreign_key_violation_is_rejected_on_open() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("foreign-key-violation.sqlite3");
-        drop(Database::open(&path).expect("initialize database"));
-
-        let connection = Connection::open(&path).expect("reopen without app pragmas");
-        connection
-            .execute_batch("PRAGMA foreign_keys = OFF")
-            .expect("disable foreign keys for corruption fixture");
-        connection
+    fn oversized_built_request_is_rejected_without_message_or_usage_marker() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let escaped_content = "\\".repeat(MAX_USER_MESSAGE_BYTES);
+        database
+            .lock()
+            .unwrap()
             .execute(
                 "INSERT INTO messages
-                 (id, conversation_id, position, role, content, token_usage, created_at, status)
-                 VALUES (?1, ?2, 0, 'user', 'orphan', NULL, ?3, 'complete')",
+                 (id,conversation_id,position,role,content,input_tokens,cached_input_tokens,output_tokens,total_tokens,created_at,status,finish_reason)
+                 VALUES(?1,?2,0,'assistant',?3,NULL,NULL,NULL,NULL,?4,'complete','stop')",
                 params![
                     Uuid::new_v4().to_string(),
-                    Uuid::new_v4().to_string(),
+                    conversation.id,
+                    escaped_content,
                     now_utc()
                 ],
             )
-            .expect("orphan fixture should be inserted");
+            .unwrap();
+        let provider = ProviderClient::new().unwrap();
+        let operation_id = Uuid::new_v4().to_string();
+        let result = database.prepare_generation(
+            &operation_id,
+            &conversation.id,
+            escaped_content,
+            ResponseProfile::Standard,
+            None,
+            |prepared| {
+                provider
+                    .prepare_chat(
+                        prepared.provider_id,
+                        &prepared.model_id,
+                        prepared.response_profile,
+                        &prepared.history,
+                    )
+                    .map(|_| ())
+            },
+        );
+        assert!(matches!(result, Err(AppError::Validation(_))));
+        assert_eq!(
+            database
+                .get_conversation(&conversation.id)
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .usage_summary(ProviderId::Zai, None)
+                .unwrap()
+                .coverage,
+            "empty"
+        );
+    }
+
+    #[test]
+    fn started_event_failure_and_pre_network_cancel_leave_no_marker() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let cancellation = CancellationToken::new();
+        let failed_emit = database.prepare_generation(
+            &Uuid::new_v4().to_string(),
+            &conversation.id,
+            "No event".to_owned(),
+            ResponseProfile::Standard,
+            None,
+            |_| crate::complete_generation_preflight(&cancellation, || Err(AppError::Internal)),
+        );
+        assert!(matches!(failed_emit, Err(AppError::Internal)));
+        assert!(
+            database
+                .get_conversation(&conversation.id)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .usage_summary(ProviderId::Zai, None)
+                .unwrap()
+                .coverage,
+            "empty"
+        );
+
+        let cancelled_during_emit = database.prepare_generation(
+            &Uuid::new_v4().to_string(),
+            &conversation.id,
+            "Cancelled before network".to_owned(),
+            ResponseProfile::Standard,
+            None,
+            |_| {
+                crate::complete_generation_preflight(&cancellation, || {
+                    cancellation.cancel();
+                    Ok(())
+                })
+            },
+        );
+        assert!(matches!(cancelled_during_emit, Err(AppError::Cancelled)));
+        assert!(
+            database
+                .get_conversation(&conversation.id)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .usage_summary(ProviderId::Zai, None)
+                .unwrap()
+                .coverage,
+            "empty"
+        );
+    }
+
+    #[test]
+    fn advisory_budget_threshold_is_exact_and_never_blocks_usage() {
+        let database = Database::open_in_memory().unwrap();
+        database
+            .set_usage_budget(ProviderId::Zai, Some(100))
+            .unwrap();
+        let operation_id = Uuid::new_v4().to_string();
+        database
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        database
+            .complete_usage_observation(
+                &operation_id,
+                &TokenUsage::new(Some(90), Some(0), Some(0), Some(90)).unwrap(),
+            )
+            .unwrap();
+        let summary = database.usage_summary(ProviderId::Zai, None).unwrap();
+        let budget = summary.budget.unwrap();
+        assert_eq!(budget.remaining_tokens, 10);
+        assert_eq!(budget.state, "low");
+        database.set_usage_budget(ProviderId::Zai, None).unwrap();
+        assert!(
+            database
+                .usage_summary(ProviderId::Zai, None)
+                .unwrap()
+                .budget
+                .is_none()
+        );
+
+        for (known_usage, expected_state) in
+            [(89, "normal"), (90, "low"), (91, "low"), (100, "exhausted")]
+        {
+            let database = Database::open_in_memory().unwrap();
+            database
+                .set_usage_budget(ProviderId::Google, Some(100))
+                .unwrap();
+            let operation_id = Uuid::new_v4().to_string();
+            database
+                .begin_usage_observation(&operation_id, ProviderId::Google, "gemini-2.5-flash")
+                .unwrap();
+            database
+                .complete_usage_observation(
+                    &operation_id,
+                    &TokenUsage::new(Some(known_usage), Some(0), Some(0), Some(known_usage))
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                database
+                    .usage_summary(ProviderId::Google, None)
+                    .unwrap()
+                    .budget
+                    .unwrap()
+                    .state,
+                expected_state
+            );
+        }
+
+        let database = Database::open_in_memory().unwrap();
+        assert!(database.set_usage_budget(ProviderId::Zai, Some(1)).is_ok());
+        assert!(
+            database
+                .set_usage_budget(ProviderId::Zai, Some(MAX_SAFE_INTEGER))
+                .is_ok()
+        );
+        assert!(database.set_usage_budget(ProviderId::Zai, Some(0)).is_err());
+    }
+
+    #[test]
+    fn model_filter_never_narrows_provider_wide_budget_consumption() {
+        let database = Database::open_in_memory().unwrap();
+        database
+            .set_usage_budget(ProviderId::Google, Some(100))
+            .unwrap();
+        for (model, total) in [("gemini-2.5-flash", 5), ("gemini-2.5-pro", 86)] {
+            let operation_id = Uuid::new_v4().to_string();
+            database
+                .begin_usage_observation(&operation_id, ProviderId::Google, model)
+                .unwrap();
+            database
+                .complete_usage_observation(
+                    &operation_id,
+                    &TokenUsage::new(Some(total), Some(0), Some(0), Some(total)).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let filtered = database
+            .usage_summary(ProviderId::Google, Some("gemini-2.5-flash"))
+            .unwrap();
+        assert_eq!(filtered.usage.total_tokens, Some(5));
+        let budget = filtered.budget.unwrap();
+        assert_eq!(budget.known_used_tokens, Some(91));
+        assert_eq!(budget.remaining_tokens, 9);
+        assert_eq!(budget.state, "low");
+    }
+
+    #[test]
+    fn budget_threshold_is_integer_exact_and_aggregate_overflow_stays_exhausted() {
+        let database = Database::open_in_memory().unwrap();
+        let token_budget = 9_007_199_254_740_989;
+        let known_used = 8_106_479_329_266_890;
+        database
+            .set_usage_budget(ProviderId::Zai, Some(token_budget))
+            .unwrap();
+        let operation_id = Uuid::new_v4().to_string();
+        database
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        database
+            .complete_usage_observation(
+                &operation_id,
+                &TokenUsage::new(Some(known_used), Some(0), Some(0), Some(known_used)).unwrap(),
+            )
+            .unwrap();
+
+        let exact = database.usage_summary(ProviderId::Zai, None).unwrap();
+        let exact_budget = exact.budget.unwrap();
+        assert_eq!(exact_budget.known_used_tokens, Some(known_used));
+        assert_eq!(exact_budget.remaining_tokens, 900_719_925_474_099);
+        assert_eq!(exact_budget.state, "normal");
+
+        let overflowed = Database::open_in_memory().unwrap();
+        overflowed
+            .set_usage_budget(ProviderId::Google, Some(100))
+            .unwrap();
+        for used in [MAX_SAFE_INTEGER, 1] {
+            let operation_id = Uuid::new_v4().to_string();
+            overflowed
+                .begin_usage_observation(&operation_id, ProviderId::Google, "gemini-2.5-flash")
+                .unwrap();
+            overflowed
+                .complete_usage_observation(
+                    &operation_id,
+                    &TokenUsage::new(Some(used), Some(0), Some(0), Some(used)).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let overflow_summary = overflowed
+            .usage_summary(ProviderId::Google, Some("gemini-2.5-flash"))
+            .unwrap();
+        let overflow_budget = overflow_summary.budget.unwrap();
+        assert_eq!(overflow_summary.coverage, "partial");
+        assert_eq!(overflow_summary.usage.total_tokens, None);
+        assert_eq!(overflow_budget.known_used_tokens, None);
+        assert_eq!(overflow_budget.remaining_tokens, 0);
+        assert_eq!(overflow_budget.remaining_percentage, 0.0);
+        assert_eq!(overflow_budget.state, "exhausted");
+    }
+
+    #[test]
+    fn usage_window_has_exact_inclusive_seven_day_boundaries() {
+        let database = Database::open_in_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
+        let start = now - Duration::days(7);
+        let cases = [
+            (start - Duration::milliseconds(1), 13_u64),
+            (start, 11_u64),
+            (now, 17_u64),
+            (now + Duration::milliseconds(1), 19_u64),
+        ];
+        let connection = database.lock().unwrap();
+        for (timestamp, total) in cases {
+            connection
+                .execute(
+                    "INSERT INTO usage_observations
+                     (operation_id,provider_id,model_id,observed_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,partial)
+                     VALUES(?1,'google','gemini-2.5-flash',?2,?3,0,0,?3,0)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        canonical_utc(timestamp),
+                        i64::try_from(total).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
         drop(connection);
+        let summary = database
+            .usage_summary_at(ProviderId::Google, Some("gemini-2.5-flash"), now)
+            .unwrap();
+        assert_eq!(summary.usage.total_tokens, Some(28));
+        assert_eq!(summary.complete_observations, 2);
+        assert_eq!(summary.partial_observations, 0);
+        assert_eq!(summary.window_start, canonical_utc(start));
+        assert_eq!(summary.window_end, canonical_utc(now));
+    }
+
+    #[test]
+    fn notice_acknowledgement_is_provider_and_version_scoped() {
+        let database = Database::open_in_memory().unwrap();
+        assert!(
+            !database
+                .notice_acknowledged(ProviderId::DeepSeek, 1)
+                .unwrap()
+        );
+        database
+            .acknowledge_notice(ProviderId::DeepSeek, 1)
+            .unwrap();
+        assert!(
+            database
+                .notice_acknowledged(ProviderId::DeepSeek, 1)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .notice_acknowledged(ProviderId::DeepSeek, 2)
+                .unwrap()
+        );
+        assert!(!database.notice_acknowledged(ProviderId::Zai, 1).unwrap());
+    }
+
+    #[test]
+    fn v1_and_v2_imports_map_pairs_without_seeding_usage_ledger() {
+        let database = Database::open_in_memory().unwrap();
+        let v1 = r#"{"format":"aster-conversation","version":1,"exportedAt":"2026-07-13T10:00:00Z","conversations":[{"title":"Legacy","model":"glm-5.1","reasoningMode":"standard","createdAt":"2026-07-13T10:00:00Z","updatedAt":"2026-07-13T10:00:00Z","messages":[{"role":"assistant","content":"Old","createdAt":"2026-07-13T10:00:00Z","status":"complete","tokenUsage":12}]}]}"#;
+        let imported = database.import(serde_json::from_str(v1).unwrap()).unwrap();
+        assert_eq!(imported[0].provider_id, ProviderId::Zai);
+        assert_eq!(
+            database.get_conversation(&imported[0].id).unwrap().messages[0].finish_reason,
+            Some(MessageFinishReason::Unknown)
+        );
+        assert_eq!(
+            database
+                .usage_summary(ProviderId::Zai, None)
+                .unwrap()
+                .coverage,
+            "empty"
+        );
+
+        let v2 = r#"{"format":"aster-conversation","version":2,"exportedAt":"2026-07-13T10:00:00Z","conversations":[{"title":"Gemini","provider":"google","model":"gemini-2.5-pro","responseProfile":"fast","createdAt":"2026-07-13T10:00:00Z","updatedAt":"2026-07-13T10:00:00Z","messages":[{"role":"assistant","content":"Imported answer","createdAt":"2026-07-13T10:00:00Z","status":"complete"}]}]}"#;
+        let imported = database.import(serde_json::from_str(v2).unwrap()).unwrap();
+        assert_eq!(imported[0].provider_id, ProviderId::Google);
+        assert_eq!(imported[0].model_id, "gemini-2.5-pro");
+        assert_eq!(
+            database.get_conversation(&imported[0].id).unwrap().messages[0].finish_reason,
+            Some(MessageFinishReason::Unknown)
+        );
+    }
+
+    #[test]
+    fn invalid_import_usage_role_or_status_is_rejected_atomically() {
+        let database = Database::open_in_memory().unwrap();
+        let invalid = r#"{"format":"aster-conversation","version":2,"exportedAt":"2026-07-13T10:00:00Z","conversations":[{"title":"Invalid usage","provider":"google","model":"gemini-2.5-pro","responseProfile":"fast","createdAt":"2026-07-13T10:00:00Z","updatedAt":"2026-07-13T10:00:00Z","messages":[{"role":"assistant","content":"Stopped","createdAt":"2026-07-13T10:00:00Z","status":"cancelled","usage":{"inputTokens":1,"cachedInputTokens":0,"outputTokens":1,"totalTokens":2}}]}]}"#;
+        assert!(
+            database
+                .import(serde_json::from_str(invalid).unwrap())
+                .is_err()
+        );
+        assert!(database.list_conversations().unwrap().is_empty());
+        assert_eq!(
+            database
+                .usage_summary(ProviderId::Google, None)
+                .unwrap()
+                .coverage,
+            "empty"
+        );
+    }
+
+    #[test]
+    fn tampered_user_message_usage_metadata_fails_closed_on_read() {
+        let database = Database::open_in_memory().unwrap();
+        let conversation = database.create_conversation(None, None, None).unwrap();
+        let message_id = Uuid::new_v4().to_string();
+        {
+            let connection = database.lock().unwrap();
+            let insert_message = || {
+                connection.execute(
+                    "INSERT INTO messages
+                     (id,conversation_id,position,role,content,input_tokens,cached_input_tokens,output_tokens,total_tokens,created_at,status,finish_reason)
+                     VALUES(?1,?2,0,'user','Tampered usage',1,0,0,1,?3,'complete',NULL)",
+                    params![message_id, conversation.id, now_utc()],
+                )
+            };
+            assert!(insert_message().is_err());
+
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            insert_message().unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints=OFF;")
+                .unwrap();
+        }
 
         assert!(matches!(
-            Database::open(&path),
+            database.get_conversation(&conversation.id),
             Err(AppError::DatabaseIntegrity)
         ));
+    }
+
+    #[test]
+    fn usage_ledger_rejects_a_noncanonical_operation_uuid_on_read() {
+        let database = Database::open_in_memory().unwrap();
+        let operation_id = "550E8400-E29B-41D4-A716-446655440000";
+        let observed_at = "2026-07-14T00:00:00.000Z";
+        {
+            let connection = database.lock().unwrap();
+            let insert_observation = || {
+                connection.execute(
+                    "INSERT INTO usage_observations
+                     (operation_id,provider_id,model_id,observed_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,partial)
+                     VALUES(?1,'zai','glm-5.1',?2,NULL,NULL,NULL,NULL,1)",
+                    params![operation_id, observed_at],
+                )
+            };
+            assert!(Uuid::parse_str(operation_id).is_ok());
+            assert!(insert_observation().is_err());
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            insert_observation().unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints=OFF;")
+                .unwrap();
+        }
+
+        assert!(matches!(
+            database.usage_summary(ProviderId::Zai, None),
+            Err(AppError::DatabaseIntegrity)
+        ));
+    }
+
+    #[test]
+    fn usage_ledger_rejects_an_invalid_time_on_read() {
+        let database = Database::open_in_memory().unwrap();
+        database
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_observations
+                 (operation_id,provider_id,model_id,observed_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,partial)
+                 VALUES(?1,'zai','glm-5.1','2026-07-14T24:00:00.000Z',NULL,NULL,NULL,NULL,1)",
+                [Uuid::new_v4().to_string()],
+            )
+            .expect("the storage shape constraint intentionally permits semantic validation");
+
+        assert!(matches!(
+            database.usage_summary(ProviderId::Zai, None),
+            Err(AppError::DatabaseIntegrity)
+        ));
+    }
+
+    #[test]
+    fn usage_ledger_rejects_a_valid_shape_but_invalid_date_on_read() {
+        let database = Database::open_in_memory().unwrap();
+        database
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_observations
+                 (operation_id,provider_id,model_id,observed_at,input_tokens,cached_input_tokens,output_tokens,total_tokens,partial)
+                 VALUES(?1,'zai','glm-5.1','2026-02-30T00:00:00.000Z',NULL,NULL,NULL,NULL,1)",
+                [Uuid::new_v4().to_string()],
+            )
+            .expect("the storage shape constraint intentionally permits semantic validation");
+
+        assert!(matches!(
+            database.usage_summary(ProviderId::Zai, None),
+            Err(AppError::DatabaseIntegrity)
+        ));
+    }
+
+    #[test]
+    fn canonical_usage_ledger_metadata_remains_readable() {
+        let database = Database::open_in_memory().unwrap();
+        let operation_id = Uuid::new_v4().to_string();
+        database
+            .begin_usage_observation(&operation_id, ProviderId::Zai, "glm-5.1")
+            .unwrap();
+        database
+            .complete_usage_observation(
+                &operation_id,
+                &TokenUsage::new(Some(8), Some(2), Some(30), Some(40)).unwrap(),
+            )
+            .unwrap();
+
+        let summary = database.usage_summary(ProviderId::Zai, None).unwrap();
+        assert_eq!(summary.coverage, "complete");
+        assert_eq!(summary.complete_observations, 1);
+        assert_eq!(summary.partial_observations, 0);
+        assert_eq!(summary.usage.total_tokens, Some(40));
+    }
+
+    #[test]
+    fn v2_finish_reason_round_trips_and_wrong_role_is_rejected() {
+        let database = Database::open_in_memory().unwrap();
+        let valid = r#"{"format":"aster-conversation","version":2,"exportedAt":"2026-07-13T10:00:00Z","conversations":[{"title":"Limited","provider":"zai","model":"glm-5.1","responseProfile":"standard","createdAt":"2026-07-13T10:00:00Z","updatedAt":"2026-07-13T10:00:00Z","messages":[{"role":"assistant","content":"Partial answer","createdAt":"2026-07-13T10:00:00Z","status":"complete","finishReason":"outputLimit"}]}]}"#;
+        let imported = database
+            .import(serde_json::from_str(valid).unwrap())
+            .unwrap();
+        let conversation = database.get_conversation(&imported[0].id).unwrap();
+        assert_eq!(
+            conversation.messages[0].finish_reason,
+            Some(MessageFinishReason::OutputLimit)
+        );
+        let exported =
+            serde_json::to_value(crate::models::ExportConversation::from(conversation)).unwrap();
+        assert_eq!(
+            exported["messages"][0]["finishReason"],
+            serde_json::json!("outputLimit")
+        );
+
+        let invalid = r#"{"format":"aster-conversation","version":2,"exportedAt":"2026-07-13T10:00:00Z","conversations":[{"title":"Invalid","provider":"zai","model":"glm-5.1","responseProfile":"standard","createdAt":"2026-07-13T10:00:00Z","updatedAt":"2026-07-13T10:00:00Z","messages":[{"role":"user","content":"Hello","createdAt":"2026-07-13T10:00:00Z","status":"complete","finishReason":"stop"}]}]}"#;
+        assert!(
+            database
+                .import(serde_json::from_str(invalid).unwrap())
+                .is_err()
+        );
+        assert_eq!(database.list_conversations().unwrap().len(), 1);
     }
 }

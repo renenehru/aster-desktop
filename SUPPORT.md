@@ -1,11 +1,24 @@
 # Aster Desktop Support
 
-Aster Desktop is currently an MVP v1 engineering implementation for Windows 11. Support is community-based and provided on a best-effort basis; no response time, compatibility, uptime, or service-level commitment is promised.
+Aster Desktop is currently an MVP v2 engineering implementation for Windows 11. Support is community-based and provided on a best-effort basis; no response time, compatibility, uptime, or service-level commitment is promised.
+
+## Version support
+
+MVP v2 is the current development and community-support line. The Apache-2.0
+MVP v1 source baseline remains available for reproducibility and personal forks,
+but it is historical and is not promised ongoing compatibility or security
+backports. Use the [version selection guide](docs/version-selection.md) to compare
+capabilities, obtain the exact source snapshots, and review migration and
+downgrade limits before requesting support.
+
+Neither source baseline is a signed production release. Support applies only to
+the scope actually documented and verified for the exact revision reported by
+the requester.
 
 ## Before requesting help
 
 1. Read [README.md](README.md) for prerequisites, setup, and known scope limits.
-2. Review [docs/product-spec.md](docs/product-spec.md) to confirm that the behavior is part of MVP v1.
+2. Review [docs/product-spec.md](docs/product-spec.md) to confirm that the behavior is part of MVP v2.
 3. Search existing issues for the same symptom or proposal.
 4. Reproduce the issue using the latest source revision you can safely test.
 5. Remove API keys, authorization data, personal conversations, local paths, and other sensitive content from all evidence.
@@ -39,9 +52,9 @@ Screenshots and logs must be reviewed before upload. Do not include credentials,
 
 ## Supported scope
 
-The documented MVP targets supported 64-bit Windows 11 editions with Microsoft Edge WebView2 and the toolchain versions described in `README.md`. Projects, document attachments, voice, RAG, tool execution, arbitrary filesystem or shell access, cloud synchronization, and automatic updates are outside MVP v1.
+The documented MVP targets supported 64-bit Windows 11 editions with Microsoft Edge WebView2 and the toolchain versions described in `README.md`. Projects, document attachments, voice, RAG, tool execution, arbitrary filesystem or shell access, cloud synchronization, and automatic updates are outside MVP v2.
 
-Provider availability, model output quality, account status, billing, retention, and service limits are controlled by Z.AI. Do not share an API key with maintainers. Credential changes must use Aster's Rust-owned native Windows prompt.
+Provider availability, model output quality, account status, billing, retention, and service limits are controlled by each selected provider. Do not share a provider API key with maintainers. Credential changes must use Aster's Rust-owned native Windows prompt. Aster opens fixed official account pages in the operating system's default browser, but never purchases credits or changes a plan.
 
 ## Engineering builds
 

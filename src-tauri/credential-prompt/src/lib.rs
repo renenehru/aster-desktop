@@ -11,17 +11,41 @@ pub enum PromptOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptProvider {
+    Zai,
+    DeepSeek,
+    AlibabaUs,
+    Google,
+    Nvidia,
+}
+
+impl PromptProvider {
+    const fn credential_target(self) -> &'static str {
+        match self {
+            Self::Zai => "zai-api-key",
+            Self::DeepSeek => "deepseek-api-key",
+            Self::AlibabaUs => "alibaba-us-api-key",
+            Self::Google => "google-api-key",
+            Self::Nvidia => "nvidia-api-key",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptError {
     InvalidOwner,
     InvalidSecret,
     Unavailable,
 }
 
-pub fn prompt_api_key(owner_window: isize) -> Result<PromptOutcome, PromptError> {
+pub fn prompt_api_key(
+    owner_window: isize,
+    provider: PromptProvider,
+) -> Result<PromptOutcome, PromptError> {
     if owner_window == 0 {
         return Err(PromptError::InvalidOwner);
     }
-    windows_prompt::prompt(owner_window)
+    windows_prompt::prompt(owner_window, provider)
 }
 
 fn decode_password(buffer: &[u16]) -> Result<Zeroizing<String>, PromptError> {
@@ -56,42 +80,42 @@ mod windows_prompt {
     use windows::core::w;
     use zeroize::Zeroizing;
 
-    use super::{PromptError, PromptOutcome, decode_password};
+    use super::{PromptError, PromptOutcome, PromptProvider, decode_password};
 
     const USERNAME_CAPACITY: usize = 514;
     const PASSWORD_CAPACITY: usize = 257;
-    const USERNAME: [u16; 12] = [
-        b'z' as u16,
-        b'a' as u16,
-        b'i' as u16,
-        b'-' as u16,
-        b'a' as u16,
-        b'p' as u16,
-        b'i' as u16,
-        b'-' as u16,
-        b'k' as u16,
-        b'e' as u16,
-        b'y' as u16,
-        0,
-    ];
-
-    pub(super) fn prompt(owner_window: isize) -> Result<PromptOutcome, PromptError> {
+    pub(super) fn prompt(
+        owner_window: isize,
+        provider: PromptProvider,
+    ) -> Result<PromptOutcome, PromptError> {
         let mut username = Zeroizing::new([0_u16; USERNAME_CAPACITY]);
-        username[..USERNAME.len()].copy_from_slice(&USERNAME);
+        let target = provider
+            .credential_target()
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        if target.len() + 1 > USERNAME_CAPACITY {
+            return Err(PromptError::Unavailable);
+        }
+        username[..target.len()].copy_from_slice(&target);
         let mut password = Zeroizing::new([0_u16; PASSWORD_CAPACITY]);
+        let (message, caption, credential_target) = provider_copy(provider);
         let information = CREDUI_INFOW {
             cbSize: u32::try_from(size_of::<CREDUI_INFOW>())
                 .map_err(|_| PromptError::Unavailable)?,
             hwndParent: HWND(owner_window as *mut c_void),
-            pszMessageText: w!(
-                "Enter your Z.AI API key. Aster stores it in Windows Credential Manager."
-            ),
-            pszCaptionText: w!("Aster credential setup"),
+            pszMessageText: message,
+            pszCaptionText: caption,
             hbmBanner: HBITMAP::default(),
         };
         let flags = prompt_flags();
 
-        let return_code = invoke_credui(&information, &mut username, &mut password, flags);
+        let return_code = invoke_credui(
+            &information,
+            credential_target,
+            &mut username,
+            &mut password,
+            flags,
+        );
 
         if return_code == NO_ERROR {
             decode_password(password.as_slice()).map(PromptOutcome::Submitted)
@@ -102,9 +126,56 @@ mod windows_prompt {
         }
     }
 
+    fn provider_copy(
+        provider: PromptProvider,
+    ) -> (
+        windows::core::PCWSTR,
+        windows::core::PCWSTR,
+        windows::core::PCWSTR,
+    ) {
+        match provider {
+            PromptProvider::Zai => (
+                w!(
+                    "Enter your Z.AI API key. Aster stores it separately in Windows Credential Manager."
+                ),
+                w!("Connect Z.AI to Aster"),
+                w!("Aster:Z.AI API key capture"),
+            ),
+            PromptProvider::DeepSeek => (
+                w!(
+                    "Enter your DeepSeek API key. Aster stores it separately in Windows Credential Manager."
+                ),
+                w!("Connect DeepSeek to Aster"),
+                w!("Aster:DeepSeek API key capture"),
+            ),
+            PromptProvider::AlibabaUs => (
+                w!(
+                    "Enter your Alibaba Cloud US API key. Aster stores it separately in Windows Credential Manager."
+                ),
+                w!("Connect Alibaba Cloud (US) to Aster"),
+                w!("Aster:Alibaba Cloud US API key capture"),
+            ),
+            PromptProvider::Google => (
+                w!(
+                    "Enter your Google Gemini API key. Aster stores it separately in Windows Credential Manager."
+                ),
+                w!("Connect Google Gemini to Aster"),
+                w!("Aster:Google Gemini API key capture"),
+            ),
+            PromptProvider::Nvidia => (
+                w!(
+                    "Enter your NVIDIA API key. Aster stores it separately in Windows Credential Manager."
+                ),
+                w!("Connect NVIDIA to Aster"),
+                w!("Aster:NVIDIA API key capture"),
+            ),
+        }
+    }
+
     #[allow(unsafe_code)]
     fn invoke_credui(
         information: &CREDUI_INFOW,
+        credential_target: windows::core::PCWSTR,
         username: &mut [u16; USERNAME_CAPACITY],
         password: &mut [u16; PASSWORD_CAPACITY],
         flags: CREDUI_FLAGS,
@@ -120,7 +191,7 @@ mod windows_prompt {
         unsafe {
             CredUIPromptForCredentialsW(
                 Some(information),
-                w!("Aster:Z.AI API key capture"),
+                credential_target,
                 None,
                 0,
                 username,

@@ -1,13 +1,16 @@
 [CmdletBinding()]
 param(
     [string]$ReleaseBinary = "src-tauri\target\release\aster-desktop.exe",
-    [string]$Installer = "src-tauri\target\release\bundle\nsis\Aster_0.1.0_x64-setup.exe"
+    [string]$Installer = "src-tauri\target\release\bundle\nsis\Aster_0.2.0_x64-setup.exe"
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$identityModule = Join-Path $PSScriptRoot "Aster.BuildIdentity.psm1"
+Import-Module $identityModule -Force
+$root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+[void](Assert-AsterNoReparseAncestors -Path $root)
 $dist = Join-Path $root "dist"
 $artifacts = @(
     (Join-Path $root $ReleaseBinary),
@@ -15,36 +18,58 @@ $artifacts = @(
 )
 
 foreach ($artifact in $artifacts) {
+    [void](Resolve-AsterContainedPath -RepositoryRoot $root -Path $artifact)
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Required package artifact is missing: $artifact"
     }
 }
+[void](Resolve-AsterContainedPath -RepositoryRoot $root -Path $dist)
 if (-not (Test-Path -LiteralPath $dist -PathType Container)) {
     throw "The production frontend bundle is missing. Run the production build first."
 }
 
-$sourceMaps = @(Get-ChildItem -LiteralPath $dist -Recurse -File -Filter "*.map")
+$bundleFiles = @(Get-AsterSafeDirectoryFiles -RepositoryRoot $root -Path $dist)
+$sourceMaps = @($bundleFiles | Where-Object { [System.IO.Path]::GetExtension($_) -ieq ".map" })
 if ($sourceMaps.Count -ne 0) {
     throw "Production source maps were found in the frontend bundle."
 }
 
+$builderProfilePattern = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+    '(?!)'
+}
+else {
+    [regex]::Escape($env:USERPROFILE)
+}
 $patterns = [ordered]@{
-    BuilderProfilePath = [regex]::Escape($env:USERPROFILE)
-    PrivateKey = "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY"
+    BuilderProfilePath = $builderProfilePattern
     AuthorizationHeader = "Authorization: Bearer "
     TestCredential = "test_key_not_a_secret"
     SourceMapDirective = "sourceMappingURL"
     DevelopmentEndpoint = "(?:http|ws)://(?:127\.0\.0\.1|localhost):1420"
 }
+$sharedPatternPath = Join-Path $PSScriptRoot "secret-patterns.json"
+$sharedPatternText = Read-AsterStrictUtf8Text -RepositoryRoot $root -Path $sharedPatternPath -MaximumBytes 65536
+$sharedPatterns = $sharedPatternText | ConvertFrom-Json
+foreach ($rule in $sharedPatterns) {
+    $flags = if ($null -ne $rule.PSObject.Properties["flags"]) { [string]$rule.flags } else { "" }
+    $prefix = if ($flags.Contains("i")) { "(?i)" } else { "" }
+    $patterns["Credential/$($rule.name)"] = $prefix + $rule.pattern
+}
 
 $findings = [System.Collections.Generic.List[string]]::new()
 foreach ($artifact in $artifacts) {
+    [void](Resolve-AsterContainedPath -RepositoryRoot $root -Path $artifact)
     $bytes = [System.IO.File]::ReadAllBytes($artifact)
-    $decoded = @(
-        [System.Text.Encoding]::UTF8.GetString($bytes),
-        [System.Text.Encoding]::Unicode.GetString($bytes),
-        [System.Text.Encoding]::BigEndianUnicode.GetString($bytes)
-    )
+    [void](Resolve-AsterContainedPath -RepositoryRoot $root -Path $artifact)
+    $decoded = [System.Collections.Generic.List[string]]::new()
+    $decoded.Add([System.Text.Encoding]::UTF8.GetString($bytes))
+    foreach ($encoding in @([System.Text.Encoding]::Unicode, [System.Text.Encoding]::BigEndianUnicode)) {
+        foreach ($offset in @(0, 1)) {
+            if ($bytes.Length -gt $offset) {
+                $decoded.Add($encoding.GetString($bytes, $offset, $bytes.Length - $offset))
+            }
+        }
+    }
 
     foreach ($pattern in $patterns.GetEnumerator()) {
         foreach ($text in $decoded) {
@@ -56,12 +81,11 @@ foreach ($artifact in $artifacts) {
     }
 }
 
-$bundleFiles = Get-ChildItem -LiteralPath $dist -Recurse -File
 foreach ($file in $bundleFiles) {
-    $text = [System.IO.File]::ReadAllText($file.FullName)
+    $text = Read-AsterStrictUtf8Text -RepositoryRoot $root -Path $file -MaximumBytes 52428800
     foreach ($pattern in $patterns.GetEnumerator()) {
         if ([regex]::IsMatch($text, $pattern.Value)) {
-            $findings.Add("$($pattern.Key) in dist/$($file.Name)")
+            $findings.Add("$($pattern.Key) in dist/$([System.IO.Path]::GetFileName($file))")
         }
     }
 }

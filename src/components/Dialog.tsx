@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode, type RefObject } from "react";
 
 import { Icon } from "./Icon";
 
@@ -8,9 +8,20 @@ interface DialogProps {
   label: string;
   onClose: () => void;
   size?: "small" | "medium" | "large";
+  initialFocusRef?: RefObject<HTMLElement | null>;
 }
 
-export function Dialog({ children, description, label, onClose, size = "medium" }: DialogProps) {
+const focusableSelector =
+  "button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex='0']";
+
+export function Dialog({
+  children,
+  description,
+  initialFocusRef,
+  label,
+  onClose,
+  size = "medium",
+}: DialogProps) {
   const titleId = useId();
   const descriptionId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -23,10 +34,8 @@ export function Dialog({ children, description, label, onClose, size = "medium" 
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
-    const focusable = panel?.querySelector<HTMLElement>(
-      "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex='0']",
-    );
-    focusable?.focus();
+    const focusable = panel?.querySelector<HTMLElement>(focusableSelector);
+    (initialFocusRef?.current ?? focusable)?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -35,11 +44,7 @@ export function Dialog({ children, description, label, onClose, size = "medium" 
         return;
       }
       if (event.key !== "Tab" || !panel) return;
-      const items = Array.from(
-        panel.querySelectorAll<HTMLElement>(
-          "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex='0']",
-        ),
-      );
+      const items = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector));
       if (items.length === 0) return;
       const first = items[0];
       const last = items.at(-1);
@@ -57,7 +62,7 @@ export function Dialog({ children, description, label, onClose, size = "medium" 
       document.removeEventListener("keydown", onKeyDown);
       previouslyFocused?.focus();
     };
-  }, []);
+  }, [initialFocusRef]);
 
   return (
     <div
