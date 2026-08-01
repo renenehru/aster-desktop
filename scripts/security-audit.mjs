@@ -210,7 +210,7 @@ assert(
 );
 
 const approvedCiActionPins = new Set([
-  "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+  "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271",
