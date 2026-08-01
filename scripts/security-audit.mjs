@@ -211,7 +211,7 @@ assert(
 
 const approvedCiActionPins = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-  "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+  "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271",
   "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
