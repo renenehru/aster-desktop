@@ -29,7 +29,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.14.0
+          node-version: 24.15.0
           cache: pnpm
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
@@ -75,7 +75,7 @@ jobs:
       - name: Set up Node.js for frontend, policy, and SBOM scripts
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.14.0
+          node-version: 24.15.0
       - name: Install pnpm for the locked frontend build
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
