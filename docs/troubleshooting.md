@@ -27,8 +27,9 @@ database row, provider body, import/export content, or personal filesystem path.
 ## `pnpm` or Node.js is not found
 
 Install a supported Node.js version and pnpm, open a new PowerShell session, and
-confirm both are on `PATH`. `package.json` requires Node.js 22.12.0 or newer and
-pnpm 10.0.0 or newer; it pins pnpm 11.7.0 as the repository package manager.
+confirm both are on `PATH`. `package.json` requires Node.js compatible with
+`^22.22.2 || ^24.15.0 || >=26.0.0` and pnpm 10.0.0 or newer; it pins pnpm
+11.7.0 as the repository package manager.
 
 If `pnpm install --frozen-lockfile` reports a manifest/lockfile mismatch, do not
 discard or regenerate the lockfile as a shortcut. Confirm that the checkout is

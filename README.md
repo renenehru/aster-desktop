@@ -173,8 +173,8 @@ or changes a plan.
 ## Prerequisites
 
 - Windows 11 x64 with Microsoft Edge WebView2 Runtime.
-- Node.js 22.12 or newer.
-- pnpm 10 or newer; `package.json` declares pnpm 11.7.0.
+- Node.js matching `^22.22.2 || ^24.15.0 || >=26.0.0`.
+- pnpm 10 or newer; the repository declares pnpm 11.7.0.
 - Rust 1.97.0 with `rustfmt`, Clippy, and the
   `x86_64-pc-windows-msvc` target.
 - Microsoft Visual Studio 2022 Build Tools with the **Desktop development with

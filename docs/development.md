@@ -18,7 +18,7 @@ Aster targets the Windows desktop and the MSVC Rust toolchain.
 | Tool               | Repository requirement                                                                       |
 | ------------------ | -------------------------------------------------------------------------------------------- |
 | Windows            | Windows 11 with Microsoft Edge WebView2 Runtime                                              |
-| Node.js            | 22.12.0 or newer; CI currently uses 24.14.0                                                  |
+| Node.js            | 22.22.2+ on 22.x, 24.15.0+ on 24.x, or 26.0.0+; CI currently uses 24.15.0                    |
 | pnpm               | 10.0.0 or newer; `package.json` pins 11.7.0 as the package manager                           |
 | Rust               | 1.97.0 with `rustfmt`, Clippy, and `x86_64-pc-windows-msvc`, pinned by `rust-toolchain.toml` |
 | Native build tools | Microsoft C++ Build Tools with the **Desktop development with C++** workload and x64 tools   |
