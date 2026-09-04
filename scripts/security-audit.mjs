@@ -214,7 +214,7 @@ const approvedCiActionPins = new Set([
   "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86",
-  "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
+  "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 ]);
 const ciActionReferences = [...ciWorkflow.matchAll(/^\s*uses:\s*([^\s#]+)/gm)].map(
   (match) => match[1],
