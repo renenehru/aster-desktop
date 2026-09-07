@@ -34,7 +34,7 @@ body:
     attributes:
       label: Expected product scope
       options:
-        - MVP v1 refinement
+        - MVP v2 refinement
         - Post-MVP capability
         - Unsure
     validations:

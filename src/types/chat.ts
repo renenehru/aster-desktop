@@ -1,8 +1,23 @@
-export type ReasoningMode = "fast" | "standard" | "deep";
+import type {
+  DeepSeekBalance,
+  ModelCatalog,
+  ModelId,
+  ProviderAccountAction,
+  ProviderId,
+  ProviderStatus,
+  ResponseProfile,
+  TokenUsage,
+  UsageSummary,
+} from "./providers";
+
+export type { ResponseProfile } from "./providers";
+export type ReasoningMode = ResponseProfile;
 
 export type MessageRole = "user" | "assistant";
 
 export type MessageStatus = "complete" | "streaming" | "cancelled" | "error";
+
+export type FinishReason = "stop" | "outputLimit" | "unknown";
 
 export interface ChatMessage {
   id: string;
@@ -11,16 +26,19 @@ export interface ChatMessage {
   content: string;
   createdAt: string;
   status: MessageStatus;
+  finishReason?: FinishReason;
+  usage?: TokenUsage;
 }
 
 export interface ConversationSummary {
   id: string;
   title: string;
-  model?: string;
+  providerId: ProviderId;
+  modelId: ModelId;
   createdAt: string;
   updatedAt: string;
   messageCount?: number;
-  reasoningMode?: ReasoningMode;
+  responseProfile: ResponseProfile;
 }
 
 export interface Conversation extends ConversationSummary {
@@ -31,12 +49,11 @@ export interface AppStatus {
   mode: "desktop" | "demo";
   version?: string;
   online: boolean;
-  providerReachability?: "unknown" | "reachable" | "unreachable";
-  externalProcessingAcknowledged?: boolean;
   databaseReady?: boolean;
 }
 
 export interface CredentialStatus {
+  providerId: ProviderId;
   configured: boolean;
   source?: "credential-vault" | "demo-session" | "none";
 }
@@ -50,6 +67,8 @@ export type ChatStreamKind = "started" | "delta" | "completed" | "cancelled" | "
 export interface ChatStreamEvent {
   requestId: string;
   conversationId: string;
+  providerId: ProviderId;
+  modelId: ModelId;
   sequence: number;
   kind: ChatStreamKind;
   delta?: string;
@@ -62,7 +81,7 @@ export interface ChatStreamEvent {
 export interface SendMessageInput {
   conversationId: string;
   content: string;
-  reasoningMode: ReasoningMode;
+  responseProfile: ResponseProfile;
   regenerateFromMessageId?: string;
 }
 
@@ -80,12 +99,19 @@ export type StreamUnsubscribe = () => void;
 export interface AssistantAdapter {
   readonly runtime: "tauri" | "browser-demo";
   appStatus(): Promise<AppStatus>;
-  credentialStatus(): Promise<CredentialStatus>;
-  promptStoreApiKey(): Promise<CredentialPromptResult>;
-  deleteApiKey(): Promise<CredentialStatus>;
+  modelCatalog(): Promise<ModelCatalog>;
+  providerStatuses(): Promise<ProviderStatus[]>;
   listConversations(): Promise<ConversationSummary[]>;
   getConversation(id: string): Promise<Conversation>;
-  createConversation(title?: string): Promise<Conversation>;
+  createConversation(
+    title?: string,
+    selection?: Readonly<{ providerId: ProviderId; modelId: ModelId }>,
+  ): Promise<Conversation>;
+  updateConversationSelection(
+    conversationId: string,
+    providerId: ProviderId,
+    modelId: ModelId,
+  ): Promise<Conversation>;
   renameConversation(id: string, title: string): Promise<ConversationSummary>;
   deleteConversation(id: string): Promise<void>;
   sendMessage(input: SendMessageInput): Promise<SendMessageResult>;
@@ -94,8 +120,19 @@ export interface AssistantAdapter {
     listener: (event: ChatStreamEvent) => void,
     onUnscopedProtocolError?: () => void,
   ): Promise<StreamUnsubscribe>;
-  acknowledgeExternalProcessing(): Promise<void>;
+  acknowledgeExternalProcessing(providerId: ProviderId): Promise<void>;
+  usageSummary(providerId: ProviderId, modelId?: ModelId): Promise<UsageSummary>;
+  setUsageBudget(providerId: ProviderId, tokenBudget: number | null): Promise<UsageSummary>;
+  deepSeekBalanceStatus(): Promise<DeepSeekBalance | null>;
+  refreshDeepSeekBalance(): Promise<DeepSeekBalance>;
   openExternalUrl(url: string): Promise<void>;
   exportConversation(id: string): Promise<string | ExportResult | undefined>;
   importConversations(serialized?: string): Promise<ConversationSummary[]>;
+}
+
+export interface DesktopAssistantAdapter extends AssistantAdapter {
+  readonly runtime: "tauri";
+  promptStoreApiKey(providerId: ProviderId): Promise<CredentialPromptResult>;
+  deleteApiKey(providerId: ProviderId): Promise<CredentialStatus>;
+  openProviderAccount(providerId: ProviderId, action: ProviderAccountAction): Promise<void>;
 }

@@ -22,7 +22,7 @@ body:
     attributes:
       label: Source revision or artifact
       description: Provide the commit identifier, version, or exact engineering artifact name. State whether the source was modified.
-      placeholder: "Commit abc123 (clean) or Aster 0.1.0 engineering build"
+      placeholder: "Commit abc123 (clean) or Aster 0.2.0 engineering build"
     validations:
       required: true
   - type: dropdown

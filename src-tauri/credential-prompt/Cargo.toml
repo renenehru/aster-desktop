@@ -1,6 +1,6 @@
 [package]
 name = "aster-credential-prompt"
-version = "0.1.0"
+version = "0.2.0"
 license = "Apache-2.0"
 description = "Isolated Windows credential prompt boundary for Aster"
 homepage = "https://github.com/renenehru/aster-desktop"

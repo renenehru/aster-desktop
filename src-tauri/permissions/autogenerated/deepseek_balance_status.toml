@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-deepseek-balance-status"
+description = "Enables the deepseek_balance_status command without any pre-configured scope."
+commands.allow = ["deepseek_balance_status"]
+
+[[permission]]
+identifier = "deny-deepseek-balance-status"
+description = "Denies the deepseek_balance_status command without any pre-configured scope."
+commands.deny = ["deepseek_balance_status"]

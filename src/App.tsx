@@ -6,6 +6,7 @@ import {
   useState,
   type ChangeEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type SetStateAction,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -13,6 +14,12 @@ import asterMark from "./assets/aster-mark.svg";
 import { Dialog } from "./components/Dialog";
 import { Icon } from "./components/Icon";
 import { Markdown } from "./components/Markdown";
+import { MessageFinishNotice } from "./components/MessageFinishNotice";
+import { ModelChangeDialog } from "./components/ModelChangeDialog";
+import { ModelPickerDialog } from "./components/ModelPickerDialog";
+import { ProviderConsentDialog } from "./components/ProviderConsentDialog";
+import { ProviderSettings } from "./components/ProviderSettings";
+import { UsageDialog } from "./components/UsageDialog";
 import { assistantAdapter } from "./services/assistantAdapter";
 import type {
   AppStatus,
@@ -20,17 +27,44 @@ import type {
   ChatStreamEvent,
   Conversation,
   ConversationSummary,
-  CredentialStatus,
   ExportResult,
-  ReasoningMode,
+  ResponseProfile,
 } from "./types/chat";
+import type {
+  CatalogModel,
+  ModelCatalog,
+  ModelId,
+  ModelSelection,
+  ProviderAccountAction,
+  ProviderId,
+  ProviderStatus,
+} from "./types/providers";
+import { sameSelection, selectionLabel } from "./types/providers";
 
 const MAX_MESSAGE_LENGTH = 32_000;
+const MAX_BUFFERED_STREAM_EVENTS = 65_536;
+const MAX_BUFFERED_STREAM_BYTES = 2 * 1_024 * 1_024;
+const MAX_STREAM_EVENTS = 65_536;
+const MAX_STREAM_CONTENT_BYTES = 2 * 1_024 * 1_024;
+const streamTextEncoder = new TextEncoder();
 
 type ActiveGeneration = {
+  modelId: Conversation["modelId"];
   prompt: string;
-  requestId: string;
+  providerId: Conversation["providerId"];
+  requestId: string | null;
   state: "connecting" | "streaming" | "stopping";
+};
+
+type StreamAttempt = {
+  authoritativeRequestId: string | null;
+  bufferedBytes: number;
+  bufferedEvents: ChatStreamEvent[];
+  failure: PublicError | null;
+  modelId: Conversation["modelId"];
+  prompt: string;
+  providerId: Conversation["providerId"];
+  stopRequested: boolean;
 };
 
 type PendingSubmission = {
@@ -41,6 +75,10 @@ type PendingSubmission = {
 type PendingConsent = {
   submission: PendingSubmission;
   conversation: Conversation;
+};
+
+type CreateConversationOptions = {
+  preserveDraft?: boolean;
 };
 
 type PublicError = {
@@ -54,7 +92,11 @@ type ScopedGenerationError = {
   error: PublicError;
 };
 
-const emptyCredential: CredentialStatus = { configured: false, source: "none" };
+function streamEventContentBytes(event: ChatStreamEvent) {
+  return streamTextEncoder.encode(event.delta ?? event.message?.content ?? event.error ?? "")
+    .byteLength;
+}
+
 const emptyStatus: AppStatus = {
   mode: assistantAdapter.runtime === "tauri" ? "desktop" : "demo",
   online: true,
@@ -136,27 +178,31 @@ function streamMessageId(conversationId: string) {
 
 interface SettingsDialogProps {
   appStatus: AppStatus;
-  credential: CredentialStatus;
+  catalog: ModelCatalog;
   currentConversation: Conversation | null;
+  providerStatuses: ProviderStatus[];
+  workingProviderId: ProviderId | null;
   onClose: () => void;
-  onRequestDeleteKey: () => void;
+  onPromptCredential: (providerId: ProviderId) => void;
+  onRequestDeleteKey: (providerId: ProviderId) => void;
   onExport: () => Promise<void>;
   onImport: () => Promise<void>;
   onImportFile: (event: ChangeEvent<HTMLInputElement>) => Promise<void>;
-  onPromptSaveKey: () => Promise<void>;
   runtime: "tauri" | "browser-demo";
 }
 
 function SettingsDialog({
   appStatus,
-  credential,
+  catalog,
   currentConversation,
+  providerStatuses,
+  workingProviderId,
   onClose,
+  onPromptCredential,
   onRequestDeleteKey,
   onExport,
   onImport,
   onImportFile,
-  onPromptSaveKey,
   runtime,
 }: SettingsDialogProps) {
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -185,7 +231,7 @@ function SettingsDialog({
       <div className="settings-layout">
         <nav aria-label="Settings sections" className="settings-nav">
           <a href="#provider-settings">
-            <Icon name="key" size={16} /> Provider
+            <Icon name="key" size={16} /> Providers
           </a>
           <a href="#data-settings">
             <Icon name="archive" size={16} /> Local data
@@ -196,68 +242,20 @@ function SettingsDialog({
         </nav>
         <div className="settings-content">
           <section className="settings-section" id="provider-settings">
-            <div className="section-heading-row">
-              <div>
-                <p className="eyebrow">Provider</p>
-                <h3>Z.AI connection</h3>
-              </div>
-              {runtime === "tauri" ? (
-                <span className={`status-chip ${credential.configured ? "positive" : "neutral"}`}>
-                  <span aria-hidden="true" className="status-dot" />
-                  {credential.configured ? "Key configured" : "Setup required"}
-                </span>
-              ) : (
-                <span className="status-chip demo">
-                  <span aria-hidden="true" className="status-dot" /> Demo only
-                </span>
-              )}
-            </div>
-            {runtime === "tauri" ? (
-              <>
-                <p className="settings-copy">
-                  Aster opens a native Windows credential prompt owned by the Rust process. The key
-                  never enters this interface and is stored in Windows Credential Manager.
-                </p>
-                <button
-                  className="button primary"
-                  disabled={working !== null}
-                  type="button"
-                  onClick={() => {
-                    void run("key", onPromptSaveKey);
-                  }}
-                >
-                  <Icon name="key" size={16} />
-                  {working === "key"
-                    ? "Opening native prompt…"
-                    : credential.configured
-                      ? "Replace API key"
-                      : "Add API key"}
-                </button>
-                {credential.configured && (
-                  <button
-                    className="button danger-quiet"
-                    disabled={working !== null}
-                    type="button"
-                    onClick={onRequestDeleteKey}
-                  >
-                    <Icon name="trash" size={16} />
-                    Remove saved key
-                  </button>
-                )}
-              </>
-            ) : (
-              <div className="demo-security-panel">
-                <Icon name="shield" size={22} />
-                <div>
-                  <strong>No credentials in browser demo</strong>
-                  <p>
-                    This preview has no provider connection and cannot accept, store, or transmit an
-                    API key. Install and open the Windows desktop app to configure Z.AI through the
-                    native credential workflow.
-                  </p>
-                </div>
-              </div>
-            )}
+            <p className="eyebrow">Provider connections</p>
+            <h3>Credentials and processing boundaries</h3>
+            <p className="settings-copy">
+              Configure each provider separately. A credential is never shared with another
+              provider, and the renderer never receives its value.
+            </p>
+            <ProviderSettings
+              catalog={catalog}
+              onPromptCredential={onPromptCredential}
+              onRequestRemove={onRequestDeleteKey}
+              providerStatuses={providerStatuses}
+              runtime={runtime}
+              workingProviderId={workingProviderId}
+            />
           </section>
 
           <section className="settings-section" id="data-settings">
@@ -310,12 +308,16 @@ function SettingsDialog({
 
           <section className="settings-section" id="about-settings">
             <p className="eyebrow">Application</p>
-            <h3>Aster {appStatus.version ? `v${appStatus.version}` : "MVP v1"}</h3>
+            <h3>Aster {appStatus.version ? `v${appStatus.version}` : "MVP v2"}</h3>
             <div className="status-grid">
               <span>Runtime</span>
               <strong>{runtime === "tauri" ? "Windows desktop" : "Browser demo"}</strong>
-              <span>Model contract</span>
-              <strong>glm-5.1</strong>
+              <span>Provider contract</span>
+              <strong>
+                Catalog v{catalog.version} · {catalog.providers.length} providers ·{" "}
+                {catalog.providers.reduce((total, provider) => total + provider.models.length, 0)}{" "}
+                models
+              </strong>
               <span>Local database</span>
               <strong>
                 {runtime === "tauri"
@@ -324,15 +326,11 @@ function SettingsDialog({
                     : "Unavailable"
                   : "In memory"}
               </strong>
-              <span>Connection</span>
+              <span>Configured providers</span>
               <strong>
                 {runtime === "browser-demo"
-                  ? "Demo only"
-                  : appStatus.providerReachability === "reachable"
-                    ? "Reachable"
-                    : appStatus.providerReachability === "unreachable"
-                      ? "Unreachable"
-                      : "Not checked"}
+                  ? "Synthetic catalog only"
+                  : `${String(providerStatuses.filter((status) => status.configured).length)} of ${String(catalog.providers.length)}`}
               </strong>
               <span>Telemetry</span>
               <strong>None</strong>
@@ -354,11 +352,16 @@ interface ComposerProps {
   credentialConfigured: boolean;
   draft: string;
   editing: ChatMessage | null;
-  mode: ReasoningMode;
+  interactionDisabled: boolean;
+  mode: ResponseProfile;
+  model: CatalogModel;
+  modelLabel: string;
+  providerName: string;
   providerUnreachable: boolean;
   onCancelEdit: () => void;
   onChange: (value: string) => void;
-  onModeChange: (mode: ReasoningMode) => void;
+  onModeChange: (mode: ResponseProfile) => void;
+  onOpenModelPicker: () => void;
   onOpenSettings: () => void;
   onStop: () => Promise<void>;
   onSubmit: () => void;
@@ -371,11 +374,16 @@ function Composer({
   credentialConfigured,
   draft,
   editing,
+  interactionDisabled,
   mode,
+  model,
+  modelLabel,
+  providerName,
   providerUnreachable,
   onCancelEdit,
   onChange,
   onModeChange,
+  onOpenModelPicker,
   onOpenSettings,
   onStop,
   onSubmit,
@@ -384,7 +392,8 @@ function Composer({
 }: ComposerProps) {
   const isComposing = useRef(false);
   const blockedForCredential = runtime === "tauri" && !credentialConfigured;
-  const submitDisabled = !draft.trim() || draft.length > MAX_MESSAGE_LENGTH || Boolean(active);
+  const submitDisabled =
+    interactionDisabled || !draft.trim() || draft.length > MAX_MESSAGE_LENGTH || Boolean(active);
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !isComposing.current) {
@@ -411,8 +420,8 @@ function Composer({
         <button className="credential-callout" type="button" onClick={onOpenSettings}>
           <Icon name="key" size={16} />
           <span>
-            <strong>Connect Z.AI to send</strong>
-            <small>Add an API key securely in Settings</small>
+            <strong>Connect {providerName} to send</strong>
+            <small>Add a {providerName} API key with the native Windows prompt</small>
           </span>
           <span className="callout-action">Open settings</span>
         </button>
@@ -422,6 +431,7 @@ function Composer({
           aria-describedby="composer-hint"
           aria-label={editing ? "Edit message" : "Message Aster"}
           maxLength={MAX_MESSAGE_LENGTH + 1}
+          disabled={interactionDisabled}
           onChange={(event) => {
             onChange(event.target.value);
           }}
@@ -434,7 +444,7 @@ function Composer({
           onKeyDown={onKeyDown}
           placeholder={
             providerUnreachable
-              ? "Z.AI is currently unreachable"
+              ? `${providerName} was unreachable on the last request`
               : editing
                 ? "Revise your message"
                 : "Ask Aster anything"
@@ -455,19 +465,34 @@ function Composer({
               <Icon name="plus" size={19} />
               <span className="visually-hidden">Attachments, coming soon</span>
             </button>
+            <button
+              aria-label={`Choose model. Current selection: ${modelLabel}`}
+              className="model-picker-trigger"
+              disabled={interactionDisabled}
+              onClick={onOpenModelPicker}
+              type="button"
+            >
+              <span>{model.displayName}</span>
+              <Icon name="chevron-down" size={13} />
+            </button>
             <label className="mode-select">
               <Icon name="spark" size={15} />
-              <span className="visually-hidden">Reasoning mode</span>
+              <span className="visually-hidden">Response profile</span>
               <select
-                aria-label="Reasoning mode"
+                aria-describedby="profile-description"
+                aria-label="Response profile"
+                disabled={interactionDisabled}
                 onChange={(event) => {
-                  onModeChange(event.target.value as ReasoningMode);
+                  onModeChange(event.target.value as ResponseProfile);
                 }}
                 value={mode}
               >
-                <option value="fast">Fast · concise</option>
-                <option value="standard">Standard · balanced</option>
-                <option value="deep">Deep · longer output</option>
+                {model.profiles.map((profile) => (
+                  <option disabled={!profile.enabled} key={profile.id} value={profile.id}>
+                    {profile.label}
+                    {profile.enabled ? "" : " (not supported)"}
+                  </option>
+                ))}
               </select>
               <Icon name="chevron-down" size={13} />
             </label>
@@ -509,7 +534,11 @@ function Composer({
       <p className="composer-hint" id="composer-hint">
         {runtime === "browser-demo"
           ? "In-memory demo · no messages leave this tab"
-          : "Enter to send · Shift+Enter for a new line · Messages are processed by Z.AI"}
+          : `Enter to send · Shift+Enter for a new line · Messages are processed by ${providerName}`}
+        <span className="profile-description" id="profile-description">
+          {model.profiles.find((profile) => profile.id === mode)?.description ??
+            "Provider-specific response profile"}
+        </span>
       </p>
     </div>
   );
@@ -517,8 +546,10 @@ function Composer({
 
 export default function App() {
   const runtime = assistantAdapter.runtime;
+  const desktopAdapter = assistantAdapter.runtime === "tauri" ? assistantAdapter : null;
   const [appStatus, setAppStatus] = useState<AppStatus>(emptyStatus);
-  const [credential, setCredential] = useState<CredentialStatus>(emptyCredential);
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
+  const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([]);
   const [summaries, setSummaries] = useState<ConversationSummary[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -529,16 +560,23 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [confirmKeyRemoval, setConfirmKeyRemoval] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [pendingModelChange, setPendingModelChange] = useState<ModelSelection | null>(null);
+  const [changingModel, setChangingModel] = useState(false);
+  const [updatingConversationSelection, setUpdatingConversationSelection] = useState(false);
+  const [confirmKeyRemoval, setConfirmKeyRemoval] = useState<ProviderId | null>(null);
+  const [credentialWorkingProvider, setCredentialWorkingProvider] = useState<ProviderId | null>(
+    null,
+  );
   const [removingKey, setRemovingKey] = useState(false);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<ConversationSummary | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ConversationSummary | null>(null);
   const [pendingNotice, setPendingNotice] = useState<PendingConsent | null>(null);
-  const [externalNoticeAccepted, setExternalNoticeAccepted] = useState(false);
   const [acknowledgingExternal, setAcknowledgingExternal] = useState(false);
   const [draft, setDraft] = useState("");
-  const [mode, setMode] = useState<ReasoningMode>("standard");
+  const [mode, setMode] = useState<ResponseProfile>("standard");
   const [editing, setEditing] = useState<ChatMessage | null>(null);
   const [activeByConversation, setActiveByConversation] = useState<
     Record<string, ActiveGeneration>
@@ -547,17 +585,54 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [onboardingVisible, setOnboardingVisible] = useState(true);
 
+  const loadUsageForDialog = useCallback(
+    (providerId: ProviderId, modelId?: ModelId) =>
+      assistantAdapter.usageSummary(providerId, modelId),
+    [],
+  );
+  const setUsageBudgetForDialog = useCallback(
+    (providerId: ProviderId, tokenBudget: number | null) =>
+      assistantAdapter.setUsageBudget(providerId, tokenBudget),
+    [],
+  );
+  const loadDeepSeekBalanceForDialog = useCallback(
+    () => assistantAdapter.deepSeekBalanceStatus(),
+    [],
+  );
+  const refreshDeepSeekBalanceForDialog = useCallback(
+    () => assistantAdapter.refreshDeepSeekBalance(),
+    [],
+  );
+  const openProviderAccountForDialog = useCallback(
+    async (providerId: ProviderId, action: ProviderAccountAction) => {
+      if (!desktopAdapter) {
+        throw new Error("Provider account actions require the Windows desktop app.");
+      }
+      await desktopAdapter.openProviderAccount(providerId, action);
+    },
+    [desktopAdapter],
+  );
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const renameRef = useRef<HTMLInputElement>(null);
   const selectedIdRef = useRef<string | null>(null);
+  const conversationIntentVersionRef = useRef(0);
+  const summariesVersionRef = useRef(0);
   const activeRef = useRef(new Map<string, ActiveGeneration>());
   const pendingConversationRef = useRef(new Set<string>());
   const pendingPromptRef = useRef(new Map<string, string>());
   const snapshotsRef = useRef(new Map<string, Conversation>());
   const partialContentRef = useRef(new Map<string, string>());
   const conversationFetchVersionRef = useRef(0);
+  const conversationReadVersionRef = useRef(new Map<string, number>());
+  const loadingConversationRef = useRef(false);
+  const selectionMutationVersionRef = useRef(0);
+  const selectionMutationPendingRef = useRef(false);
   const streamSequenceRef = useRef(new Map<string, number>());
+  const streamEventCountRef = useRef(new Map<string, number>());
+  const streamContentBytesRef = useRef(new Map<string, number>());
+  const streamAttemptsRef = useRef(new Map<string, StreamAttempt>());
   const failedSequenceRequestsRef = useRef(new Set<string>());
   const sequenceRecoveryTimersRef = useRef(new Map<string, number>());
 
@@ -583,6 +658,17 @@ export default function App() {
   }, [draft]);
 
   const setActive = useCallback((conversationId: string, next?: ActiveGeneration) => {
+    const currentActive = activeRef.current.get(conversationId);
+    if (
+      next &&
+      currentActive?.modelId === next.modelId &&
+      currentActive.prompt === next.prompt &&
+      currentActive.providerId === next.providerId &&
+      currentActive.requestId === next.requestId &&
+      currentActive.state === next.state
+    )
+      return;
+    if (!next && !currentActive) return;
     if (next) activeRef.current.set(conversationId, next);
     else activeRef.current.delete(conversationId);
     setActiveByConversation((current) => {
@@ -591,20 +677,34 @@ export default function App() {
     });
   }, []);
 
+  const updateSummaries = useCallback((update: SetStateAction<ConversationSummary[]>) => {
+    summariesVersionRef.current += 1;
+    setSummaries(update);
+  }, []);
+
   const refreshSummaries = useCallback(async () => {
+    const queryVersion = ++summariesVersionRef.current;
     const next = sortSummaries(await assistantAdapter.listConversations());
-    setSummaries(next);
+    if (queryVersion === summariesVersionRef.current) setSummaries(next);
     return next;
   }, []);
 
   const loadConversation = useCallback(async (conversationId: string) => {
     const loadToken = ++conversationFetchVersionRef.current;
+    const readToken = (conversationReadVersionRef.current.get(conversationId) ?? 0) + 1;
+    conversationReadVersionRef.current.set(conversationId, readToken);
+    selectionMutationVersionRef.current += 1;
+    selectionMutationPendingRef.current = false;
+    setUpdatingConversationSelection(false);
+    setConversation(null);
+    loadingConversationRef.current = true;
     setLoadingConversation(true);
     setGenerationError((current) => (current?.conversationId === conversationId ? null : current));
     try {
       const next = await assistantAdapter.getConversation(conversationId);
       if (
         loadToken !== conversationFetchVersionRef.current ||
+        conversationReadVersionRef.current.get(conversationId) !== readToken ||
         selectedIdRef.current !== conversationId
       )
         return;
@@ -627,36 +727,41 @@ export default function App() {
           }
         : next;
       setConversation(hydrated);
-      setMode(next.reasoningMode ?? "standard");
+      setMode(next.responseProfile);
       setLoadError(null);
     } catch (error) {
       if (
         loadToken !== conversationFetchVersionRef.current ||
+        conversationReadVersionRef.current.get(conversationId) !== readToken ||
         selectedIdRef.current !== conversationId
       )
         return;
       setConversation(null);
       setLoadError(publicError(error).message);
     } finally {
-      if (loadToken === conversationFetchVersionRef.current) setLoadingConversation(false);
+      if (loadToken === conversationFetchVersionRef.current) {
+        loadingConversationRef.current = false;
+        setLoadingConversation(false);
+      }
     }
   }, []);
 
   const reconcileConversation = useCallback(
     async (conversationId: string, releaseActive = false) => {
-      const fetchVersion = ++conversationFetchVersionRef.current;
+      const readToken = (conversationReadVersionRef.current.get(conversationId) ?? 0) + 1;
+      conversationReadVersionRef.current.set(conversationId, readToken);
       try {
         const authoritative = await assistantAdapter.getConversation(conversationId);
         if (
-          fetchVersion === conversationFetchVersionRef.current &&
+          conversationReadVersionRef.current.get(conversationId) === readToken &&
           selectedIdRef.current === conversationId
         ) {
           setConversation(authoritative);
-          setMode(authoritative.reasoningMode ?? "standard");
+          setMode(authoritative.responseProfile);
         }
       } catch (error) {
         if (
-          fetchVersion === conversationFetchVersionRef.current &&
+          conversationReadVersionRef.current.get(conversationId) === readToken &&
           selectedIdRef.current === conversationId
         ) {
           setLoadError(publicError(error).message);
@@ -671,7 +776,33 @@ export default function App() {
     [refreshSummaries, setActive],
   );
 
-  const handleStream = useCallback(
+  const failStreamAttempt = useCallback(
+    (conversationId: string, requestId: string, error: PublicError) => {
+      failedSequenceRequestsRef.current.add(requestId);
+      pendingConversationRef.current.delete(conversationId);
+      pendingPromptRef.current.delete(conversationId);
+      snapshotsRef.current.delete(conversationId);
+      partialContentRef.current.delete(conversationId);
+      streamAttemptsRef.current.delete(conversationId);
+      streamSequenceRef.current.delete(requestId);
+      streamEventCountRef.current.delete(requestId);
+      streamContentBytesRef.current.delete(requestId);
+      setGenerationError({ conversationId, error });
+      const active = activeRef.current.get(conversationId);
+      if (active) setActive(conversationId, { ...active, requestId, state: "stopping" });
+      void assistantAdapter.cancelGeneration(requestId).catch(() => undefined);
+      const recoveryTimer = window.setTimeout(() => {
+        if (failedSequenceRequestsRef.current.delete(requestId)) {
+          void reconcileConversation(conversationId, true);
+        }
+        sequenceRecoveryTimersRef.current.delete(requestId);
+      }, 1_500);
+      sequenceRecoveryTimersRef.current.set(requestId, recoveryTimer);
+    },
+    [reconcileConversation, setActive],
+  );
+
+  const processAuthoritativeStreamEvent = useCallback(
     (event: ChatStreamEvent) => {
       if (failedSequenceRequestsRef.current.has(event.requestId)) {
         if (event.kind === "completed" || event.kind === "cancelled" || event.kind === "error") {
@@ -683,44 +814,83 @@ export default function App() {
         }
         return;
       }
+
+      const attempt = streamAttemptsRef.current.get(event.conversationId);
       const active = activeRef.current.get(event.conversationId);
-      const isPending = pendingConversationRef.current.has(event.conversationId);
-      if (active && active.requestId && active.requestId !== event.requestId) return;
-      if (!active && !isPending) return;
-      const expectedSequence = streamSequenceRef.current.get(event.requestId) ?? 0;
-      if (event.sequence < expectedSequence) return;
-      if (event.sequence > expectedSequence) {
-        failedSequenceRequestsRef.current.add(event.requestId);
-        pendingConversationRef.current.delete(event.conversationId);
-        pendingPromptRef.current.delete(event.conversationId);
-        snapshotsRef.current.delete(event.conversationId);
-        partialContentRef.current.delete(event.conversationId);
-        streamSequenceRef.current.delete(event.requestId);
-        setGenerationError({
-          conversationId: event.conversationId,
-          error: {
-            code: "stream_sequence_error",
-            message: "The response stream arrived out of order. Retry the response.",
-            retryable: true,
-          },
+      if (
+        !attempt ||
+        attempt.authoritativeRequestId !== event.requestId ||
+        !active ||
+        active.requestId !== event.requestId
+      )
+        return;
+
+      if (attempt.providerId !== event.providerId || attempt.modelId !== event.modelId) {
+        failStreamAttempt(event.conversationId, event.requestId, {
+          code: "stream_identity_error",
+          message: "Aster rejected a response bound to a different provider or model.",
+          retryable: true,
         });
-        void assistantAdapter.cancelGeneration(event.requestId).catch(() => undefined);
-        const recoveryTimer = window.setTimeout(() => {
-          if (failedSequenceRequestsRef.current.delete(event.requestId)) {
-            void reconcileConversation(event.conversationId, true);
-          }
-          sequenceRecoveryTimersRef.current.delete(event.requestId);
-        }, 1_500);
-        sequenceRecoveryTimersRef.current.set(event.requestId, recoveryTimer);
         return;
       }
-      streamSequenceRef.current.set(event.requestId, expectedSequence + 1);
 
-      const prompt = active?.prompt ?? pendingPromptRef.current.get(event.conversationId) ?? "";
+      const expectedSequence = streamSequenceRef.current.get(event.requestId);
+      if (expectedSequence === undefined) {
+        if (event.kind !== "started" || event.sequence !== 0) {
+          failStreamAttempt(event.conversationId, event.requestId, {
+            code: "stream_start_error",
+            message: "The response stream did not begin correctly. Retry the response.",
+            retryable: true,
+          });
+          return;
+        }
+      } else if (event.kind === "started" || event.sequence !== expectedSequence) {
+        failStreamAttempt(event.conversationId, event.requestId, {
+          code: "stream_sequence_error",
+          message: "The response stream arrived out of order. Retry the response.",
+          retryable: true,
+        });
+        return;
+      }
+
+      const eventCount = (streamEventCountRef.current.get(event.requestId) ?? 0) + 1;
+      if (eventCount > MAX_STREAM_EVENTS) {
+        failStreamAttempt(event.conversationId, event.requestId, {
+          code: "stream_limit_error",
+          message: "The response stream exceeded Aster's safety limits. Retry the response.",
+          retryable: true,
+        });
+        return;
+      }
+      streamEventCountRef.current.set(event.requestId, eventCount);
+
+      if (event.kind === "delta") {
+        const contentBytes =
+          (streamContentBytesRef.current.get(event.requestId) ?? 0) +
+          streamTextEncoder.encode(event.delta ?? "").byteLength;
+        if (contentBytes > MAX_STREAM_CONTENT_BYTES) {
+          failStreamAttempt(event.conversationId, event.requestId, {
+            code: "stream_limit_error",
+            message: "The response stream exceeded Aster's safety limits. Retry the response.",
+            retryable: true,
+          });
+          return;
+        }
+        streamContentBytesRef.current.set(event.requestId, contentBytes);
+      }
+      streamSequenceRef.current.set(event.requestId, event.sequence + 1);
+
       const tracked: ActiveGeneration = {
-        prompt,
+        modelId: event.modelId,
+        prompt: attempt.prompt,
+        providerId: event.providerId,
         requestId: event.requestId,
-        state: event.kind === "started" ? "connecting" : "streaming",
+        state:
+          active.state === "stopping"
+            ? "stopping"
+            : event.kind === "started"
+              ? "connecting"
+              : "streaming",
       };
 
       if (event.kind === "started") {
@@ -729,13 +899,13 @@ export default function App() {
       }
 
       if (event.kind === "delta") {
-        const delta = event.delta;
-        if (!delta) return;
+        const delta = event.delta ?? "";
         partialContentRef.current.set(
           event.conversationId,
           (partialContentRef.current.get(event.conversationId) ?? "") + delta,
         );
-        setActive(event.conversationId, { ...tracked, state: "streaming" });
+        setActive(event.conversationId, tracked);
+        if (!delta) return;
         setConversation((current) => {
           if (current?.id !== event.conversationId) return current;
           return {
@@ -750,12 +920,23 @@ export default function App() {
         return;
       }
 
+      if (event.kind === "completed" && !event.message) {
+        failStreamAttempt(event.conversationId, event.requestId, {
+          code: "stream_terminal_error",
+          message: "Aster rejected a response without a completed message.",
+          retryable: true,
+        });
+        return;
+      }
+
       pendingConversationRef.current.delete(event.conversationId);
       pendingPromptRef.current.delete(event.conversationId);
       snapshotsRef.current.delete(event.conversationId);
       partialContentRef.current.delete(event.conversationId);
+      streamAttemptsRef.current.delete(event.conversationId);
       streamSequenceRef.current.delete(event.requestId);
-      if (!active) setActive(event.conversationId, tracked);
+      streamEventCountRef.current.delete(event.requestId);
+      streamContentBytesRef.current.delete(event.requestId);
 
       const completedMessage = event.message;
       if (event.kind === "completed" && completedMessage) {
@@ -818,11 +999,46 @@ export default function App() {
           };
         });
         if (selectedIdRef.current === event.conversationId)
-          setDraft((current) => current || prompt);
+          setDraft((current) => current || attempt.prompt);
         void reconcileConversation(event.conversationId, true);
       }
     },
-    [reconcileConversation, setActive],
+    [failStreamAttempt, reconcileConversation, setActive],
+  );
+
+  const handleStream = useCallback(
+    (event: ChatStreamEvent) => {
+      const attempt = streamAttemptsRef.current.get(event.conversationId);
+      if (attempt && attempt.authoritativeRequestId === null) {
+        if (attempt.failure) return;
+        const nextBufferedBytes = attempt.bufferedBytes + streamEventContentBytes(event);
+        if (
+          attempt.bufferedEvents.length >= MAX_BUFFERED_STREAM_EVENTS ||
+          nextBufferedBytes > MAX_BUFFERED_STREAM_BYTES
+        ) {
+          attempt.bufferedEvents = [];
+          attempt.bufferedBytes = 0;
+          attempt.failure = {
+            code: "stream_buffer_limit_error",
+            message: "The response stream exceeded Aster's safety limits before it started.",
+            retryable: true,
+          };
+          setGenerationError({ conversationId: event.conversationId, error: attempt.failure });
+          const active = activeRef.current.get(event.conversationId);
+          if (active) setActive(event.conversationId, { ...active, state: "stopping" });
+          return;
+        }
+        attempt.bufferedEvents.push(event);
+        attempt.bufferedBytes = nextBufferedBytes;
+        return;
+      }
+      if (attempt?.authoritativeRequestId !== event.requestId) {
+        processAuthoritativeStreamEvent(event);
+        return;
+      }
+      processAuthoritativeStreamEvent(event);
+    },
+    [processAuthoritativeStreamEvent, setActive],
   );
 
   const handleUnscopedStreamError = useCallback(() => {
@@ -831,50 +1047,60 @@ export default function App() {
       ...pendingConversationRef.current,
     ]);
     for (const conversationId of affectedConversations) {
+      const error = {
+        code: "malformed_stream_event",
+        message: "Aster rejected an invalid response stream event. Retry the response.",
+        retryable: true,
+      };
+      const attempt = streamAttemptsRef.current.get(conversationId);
       const active = activeRef.current.get(conversationId);
+      if (attempt && attempt.authoritativeRequestId === null) {
+        attempt.bufferedEvents = [];
+        attempt.bufferedBytes = 0;
+        attempt.failure = error;
+        setGenerationError({ conversationId, error });
+        if (active) setActive(conversationId, { ...active, state: "stopping" });
+        continue;
+      }
       if (active?.requestId) {
-        failedSequenceRequestsRef.current.add(active.requestId);
-        streamSequenceRef.current.delete(active.requestId);
-        void assistantAdapter.cancelGeneration(active.requestId).catch(() => undefined);
+        failStreamAttempt(conversationId, active.requestId, error);
+        continue;
       }
       pendingConversationRef.current.delete(conversationId);
       pendingPromptRef.current.delete(conversationId);
       snapshotsRef.current.delete(conversationId);
       partialContentRef.current.delete(conversationId);
-      if (selectedIdRef.current === conversationId) {
-        setGenerationError({
-          conversationId,
-          error: {
-            code: "malformed_stream_event",
-            message: "Aster rejected an invalid response stream event. Retry the response.",
-            retryable: true,
-          },
-        });
-      }
-      void reconcileConversation(conversationId, true).finally(() => {
-        if (active?.requestId) failedSequenceRequestsRef.current.delete(active.requestId);
-      });
+      streamAttemptsRef.current.delete(conversationId);
+      setGenerationError({ conversationId, error });
+      void reconcileConversation(conversationId, true);
     }
-  }, [reconcileConversation]);
+  }, [failStreamAttempt, reconcileConversation, setActive]);
 
   useEffect(() => {
     let alive = true;
     let unsubscribe: (() => void) | undefined;
+    const sequenceRecoveryTimers = sequenceRecoveryTimersRef.current;
+    const streamAttempts = streamAttemptsRef.current;
+    const streamSequences = streamSequenceRef.current;
+    const streamEventCounts = streamEventCountRef.current;
+    const streamContentBytes = streamContentBytesRef.current;
     const initialize = async () => {
       try {
         unsubscribe = await assistantAdapter.onChatStream(handleStream, handleUnscopedStreamError);
-        const [nextStatus, nextCredential, nextSummaries] = await Promise.all([
+        const summariesQueryVersion = ++summariesVersionRef.current;
+        const [nextStatus, nextCatalog, nextProviderStatuses, nextSummaries] = await Promise.all([
           assistantAdapter.appStatus(),
-          assistantAdapter.credentialStatus(),
+          assistantAdapter.modelCatalog(),
+          assistantAdapter.providerStatuses(),
           assistantAdapter.listConversations(),
         ]);
         if (!alive) return;
         setAppStatus(nextStatus);
-        setExternalNoticeAccepted(
-          runtime === "browser-demo" || nextStatus.externalProcessingAcknowledged === true,
-        );
-        setCredential(runtime === "browser-demo" ? emptyCredential : nextCredential);
-        setSummaries(sortSummaries(nextSummaries));
+        setCatalog(nextCatalog);
+        setProviderStatuses(nextProviderStatuses);
+        if (summariesQueryVersion === summariesVersionRef.current) {
+          setSummaries(sortSummaries(nextSummaries));
+        }
       } catch (error) {
         if (alive) setLoadError(publicError(error).message);
       } finally {
@@ -885,8 +1111,14 @@ export default function App() {
     return () => {
       alive = false;
       unsubscribe?.();
+      for (const timer of sequenceRecoveryTimers.values()) window.clearTimeout(timer);
+      sequenceRecoveryTimers.clear();
+      streamAttempts.clear();
+      streamSequences.clear();
+      streamEventCounts.clear();
+      streamContentBytes.clear();
     };
-  }, [handleStream, handleUnscopedStreamError, runtime]);
+  }, [handleStream, handleUnscopedStreamError]);
 
   const groupedSummaries = useMemo(() => {
     const filtered = summaries.filter((item) =>
@@ -902,6 +1134,7 @@ export default function App() {
 
   const selectConversation = useCallback(
     async (id: string) => {
+      conversationIntentVersionRef.current += 1;
       selectedIdRef.current = id;
       setSelectedId(id);
       setSidebarOpen(false);
@@ -913,29 +1146,82 @@ export default function App() {
     [loadConversation],
   );
 
-  const createConversation = useCallback(async () => {
-    try {
-      const next = await assistantAdapter.createConversation();
-      setSummaries((current) => sortSummaries([{ ...next, messageCount: 0 }, ...current]));
-      selectedIdRef.current = next.id;
-      setSelectedId(next.id);
-      setConversation(next);
-      setMode(next.reasoningMode ?? "standard");
-      setDraft("");
-      setEditing(null);
-      setGenerationError(null);
-      setSidebarOpen(false);
-      window.setTimeout(() => textareaRef.current?.focus(), 0);
-      return next;
-    } catch (error) {
-      setToast(publicError(error).message);
-      return null;
-    }
-  }, []);
+  const createConversation = useCallback(
+    async (selection?: ModelSelection, options: CreateConversationOptions = {}) => {
+      if (
+        !selection &&
+        selectedIdRef.current !== null &&
+        (loadingConversationRef.current ||
+          selectionMutationPendingRef.current ||
+          conversation?.id !== selectedIdRef.current)
+      )
+        return null;
+      const intentVersion = ++conversationIntentVersionRef.current;
+      try {
+        const currentConversationIsAuthoritative =
+          conversation?.id === selectedIdRef.current &&
+          !loadingConversationRef.current &&
+          !selectionMutationPendingRef.current;
+        const inheritedSelection =
+          selection ??
+          (currentConversationIsAuthoritative
+            ? ({
+                providerId: conversation.providerId,
+                modelId: conversation.modelId,
+              } as ModelSelection)
+            : undefined);
+        const next = await assistantAdapter.createConversation(undefined, inheritedSelection);
+        updateSummaries((current) =>
+          sortSummaries([
+            { ...next, messageCount: 0 },
+            ...current.filter((item) => item.id !== next.id),
+          ]),
+        );
+        if (intentVersion !== conversationIntentVersionRef.current) return null;
+        conversationFetchVersionRef.current += 1;
+        selectionMutationVersionRef.current += 1;
+        selectionMutationPendingRef.current = false;
+        loadingConversationRef.current = false;
+        setUpdatingConversationSelection(false);
+        setLoadingConversation(false);
+        selectedIdRef.current = next.id;
+        setSelectedId(next.id);
+        setConversation(next);
+        setMode(next.responseProfile);
+        if (!options.preserveDraft) setDraft("");
+        setEditing(null);
+        setGenerationError(null);
+        setSidebarOpen(false);
+        window.setTimeout(() => textareaRef.current?.focus(), 0);
+        return next;
+      } catch (error) {
+        if (intentVersion === conversationIntentVersionRef.current) {
+          setToast(publicError(error).message);
+        }
+        return null;
+      }
+    },
+    [conversation, updateSummaries],
+  );
 
   useEffect(() => {
     const shortcuts = (event: KeyboardEvent) => {
-      if (settingsOpen || confirmKeyRemoval || renameTarget || deleteTarget || pendingNotice)
+      if (loadingConversation || updatingConversationSelection) {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+          event.preventDefault();
+        }
+        return;
+      }
+      if (
+        settingsOpen ||
+        usageOpen ||
+        modelPickerOpen ||
+        pendingModelChange ||
+        confirmKeyRemoval ||
+        renameTarget ||
+        deleteTarget ||
+        pendingNotice
+      )
         return;
       if (!(event.ctrlKey || event.metaKey)) return;
       if (event.key.toLowerCase() === "k") {
@@ -958,9 +1244,14 @@ export default function App() {
     confirmKeyRemoval,
     createConversation,
     deleteTarget,
+    loadingConversation,
+    modelPickerOpen,
+    pendingModelChange,
     pendingNotice,
     renameTarget,
     settingsOpen,
+    updatingConversationSelection,
+    usageOpen,
   ]);
 
   const renameConversation = async (target: ConversationSummary, title: string) => {
@@ -968,7 +1259,7 @@ export default function App() {
     if (!trimmed) return;
     try {
       const updated = await assistantAdapter.renameConversation(target.id, trimmed);
-      setSummaries((current) =>
+      updateSummaries((current) =>
         sortSummaries(
           current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)),
         ),
@@ -988,9 +1279,16 @@ export default function App() {
     const nextSelection = summaries[index + 1]?.id ?? summaries[index - 1]?.id ?? null;
     try {
       await assistantAdapter.deleteConversation(target.id);
-      setSummaries((current) => current.filter((item) => item.id !== target.id));
+      updateSummaries((current) => current.filter((item) => item.id !== target.id));
       setDeleteTarget(null);
       if (selectedId === target.id) {
+        conversationIntentVersionRef.current += 1;
+        conversationFetchVersionRef.current += 1;
+        selectionMutationVersionRef.current += 1;
+        selectionMutationPendingRef.current = false;
+        loadingConversationRef.current = false;
+        setUpdatingConversationSelection(false);
+        setLoadingConversation(false);
         selectedIdRef.current = nextSelection;
         setSelectedId(nextSelection);
         setConversation(null);
@@ -1011,7 +1309,13 @@ export default function App() {
     submission: PendingSubmission,
     targetConversation: Conversation | null = conversation,
   ) => {
-    if (!targetConversation) return;
+    if (
+      !targetConversation ||
+      targetConversation.id !== selectedIdRef.current ||
+      loadingConversationRef.current ||
+      selectionMutationPendingRef.current
+    )
+      return;
     const content = submission.content.trim();
     if (
       !content ||
@@ -1025,6 +1329,24 @@ export default function App() {
     pendingConversationRef.current.add(conversationId);
     pendingPromptRef.current.set(conversationId, content);
     partialContentRef.current.set(conversationId, "");
+    const streamAttempt: StreamAttempt = {
+      authoritativeRequestId: null,
+      bufferedBytes: 0,
+      bufferedEvents: [],
+      failure: null,
+      modelId: targetConversation.modelId,
+      prompt: content,
+      providerId: targetConversation.providerId,
+      stopRequested: false,
+    };
+    streamAttemptsRef.current.set(conversationId, streamAttempt);
+    setActive(conversationId, {
+      modelId: targetConversation.modelId,
+      prompt: content,
+      providerId: targetConversation.providerId,
+      requestId: null,
+      state: "connecting",
+    });
     setGenerationError(null);
 
     const targetIndex = submission.regenerateFromMessageId
@@ -1068,7 +1390,7 @@ export default function App() {
     setConversation({
       ...targetConversation,
       title: nextTitle,
-      reasoningMode: mode,
+      responseProfile: mode,
       messages: optimisticMessages,
     });
     setEditing(null);
@@ -1077,19 +1399,46 @@ export default function App() {
       const result = await assistantAdapter.sendMessage({
         conversationId,
         content,
-        reasoningMode: mode,
+        responseProfile: mode,
         regenerateFromMessageId: submission.regenerateFromMessageId,
       });
+      const attempt = streamAttemptsRef.current.get(conversationId);
+      if (!attempt || attempt !== streamAttempt) return;
+      attempt.authoritativeRequestId = result.requestId;
       const existing = activeRef.current.get(conversationId);
-      if (pendingConversationRef.current.has(conversationId) || existing) {
-        setActive(conversationId, {
-          prompt: content,
-          requestId: existing?.requestId || result.requestId,
-          state: existing?.state ?? "connecting",
-        });
-      }
+      setActive(conversationId, {
+        modelId: targetConversation.modelId,
+        prompt: content,
+        providerId: targetConversation.providerId,
+        requestId: result.requestId,
+        state: attempt.stopRequested ? "stopping" : (existing?.state ?? "connecting"),
+      });
       setDraft("");
-      setSummaries((current) =>
+
+      const bufferedEvents = attempt.bufferedEvents;
+      attempt.bufferedEvents = [];
+      attempt.bufferedBytes = 0;
+      if (attempt.failure) {
+        failStreamAttempt(conversationId, result.requestId, attempt.failure);
+      } else {
+        for (const event of bufferedEvents) {
+          if (event.requestId === result.requestId) processAuthoritativeStreamEvent(event);
+        }
+        if (attempt.stopRequested && !failedSequenceRequestsRef.current.has(result.requestId)) {
+          try {
+            await assistantAdapter.cancelGeneration(result.requestId);
+          } catch (error) {
+            const currentAttempt = streamAttemptsRef.current.get(conversationId);
+            if (currentAttempt === attempt) {
+              currentAttempt.stopRequested = false;
+              const current = activeRef.current.get(conversationId);
+              if (current) setActive(conversationId, { ...current, state: "connecting" });
+            }
+            setToast(publicError(error).message);
+          }
+        }
+      }
+      updateSummaries((current) =>
         sortSummaries(
           current.map((item) =>
             item.id === conversationId
@@ -1097,7 +1446,7 @@ export default function App() {
                   ...item,
                   title: nextTitle,
                   updatedAt: new Date().toISOString(),
-                  reasoningMode: mode,
+                  responseProfile: mode,
                 }
               : item,
           ),
@@ -1107,8 +1456,15 @@ export default function App() {
       pendingConversationRef.current.delete(conversationId);
       pendingPromptRef.current.delete(conversationId);
       partialContentRef.current.delete(conversationId);
+      const failedAttempt = streamAttemptsRef.current.get(conversationId);
+      streamAttemptsRef.current.delete(conversationId);
       const failedActive = activeRef.current.get(conversationId);
-      if (failedActive?.requestId) streamSequenceRef.current.delete(failedActive.requestId);
+      const failedRequestId = failedActive?.requestId ?? failedAttempt?.authoritativeRequestId;
+      if (failedRequestId) {
+        streamSequenceRef.current.delete(failedRequestId);
+        streamEventCountRef.current.delete(failedRequestId);
+        streamContentBytesRef.current.delete(failedRequestId);
+      }
       setActive(conversationId);
       const snapshot = snapshotsRef.current.get(conversationId);
       snapshotsRef.current.delete(conversationId);
@@ -1121,48 +1477,76 @@ export default function App() {
   };
 
   const requestSubmit = () => {
-    if (runtime === "tauri" && !credential.configured) {
-      setSettingsOpen(true);
-      setToast("Add your Z.AI API key before sending");
+    if (
+      loadingConversationRef.current ||
+      selectionMutationPendingRef.current ||
+      (selectedIdRef.current !== null && conversation?.id !== selectedIdRef.current)
+    )
       return;
-    }
     const submission: PendingSubmission = {
       content: draft,
       regenerateFromMessageId: editing?.id,
     };
+    const sendWhenReady = (target: Conversation) => {
+      if (runtime === "tauri") {
+        const provider = catalog?.providers.find((item) => item.id === target.providerId);
+        const status = providerStatuses.find((item) => item.providerId === target.providerId);
+        if (!status?.configured) {
+          setSettingsOpen(true);
+          setToast(`Add your ${provider?.displayName ?? target.providerId} API key before sending`);
+          return;
+        }
+        if (
+          provider &&
+          (!status.noticeAcknowledged || status.noticeVersion !== provider.noticeVersion)
+        ) {
+          setPendingNotice({ submission, conversation: target });
+          return;
+        }
+      }
+      void performSend(submission, target);
+    };
     if (!conversation) {
       void createConversation().then((created) => {
         if (!created) return;
-        if (runtime === "tauri" && !externalNoticeAccepted) {
-          setPendingNotice({ submission, conversation: created });
-        } else {
-          void performSend(submission, created);
-        }
+        sendWhenReady(created);
       });
       return;
     }
-    if (runtime === "tauri" && !externalNoticeAccepted) {
-      setPendingNotice({ submission, conversation });
-      return;
-    }
-    void performSend(submission);
+    sendWhenReady(conversation);
   };
 
   const stopGeneration = async () => {
-    if (!conversation) return;
+    if (
+      !conversation ||
+      conversation.id !== selectedIdRef.current ||
+      loadingConversationRef.current
+    )
+      return;
     const active = activeRef.current.get(conversation.id);
     if (!active) return;
+    const attempt = streamAttemptsRef.current.get(conversation.id);
+    if (attempt) attempt.stopRequested = true;
     setActive(conversation.id, { ...active, state: "stopping" });
+    if (!active.requestId) return;
     try {
       await assistantAdapter.cancelGeneration(active.requestId);
     } catch (error) {
+      if (attempt) attempt.stopRequested = false;
       setActive(conversation.id, active);
       setToast(publicError(error).message);
     }
   };
 
   const startEditing = (message: ChatMessage) => {
-    if (activeRef.current.has(message.conversationId)) return;
+    if (
+      conversation?.id !== selectedIdRef.current ||
+      message.conversationId !== selectedIdRef.current ||
+      loadingConversationRef.current ||
+      selectionMutationPendingRef.current ||
+      activeRef.current.has(message.conversationId)
+    )
+      return;
     setEditing(message);
     setDraft(message.content);
     window.setTimeout(() => {
@@ -1172,19 +1556,43 @@ export default function App() {
   };
 
   const dispatchRegeneration = (submission: PendingSubmission) => {
-    if (!conversation) return;
-    if (runtime === "tauri" && !credential.configured) {
-      setSettingsOpen(true);
-      setToast("Add your Z.AI API key before regenerating");
-    } else if (runtime === "tauri" && !externalNoticeAccepted) {
-      setPendingNotice({ submission, conversation });
-    } else {
-      void performSend(submission);
+    if (
+      !conversation ||
+      conversation.id !== selectedIdRef.current ||
+      loadingConversationRef.current ||
+      selectionMutationPendingRef.current
+    )
+      return;
+    if (runtime === "tauri") {
+      const provider = catalog?.providers.find((item) => item.id === conversation.providerId);
+      const status = providerStatuses.find((item) => item.providerId === conversation.providerId);
+      if (!status?.configured) {
+        setSettingsOpen(true);
+        setToast(
+          `Add your ${provider?.displayName ?? conversation.providerId} API key before regenerating`,
+        );
+        return;
+      }
+      if (
+        provider &&
+        (!status.noticeAcknowledged || status.noticeVersion !== provider.noticeVersion)
+      ) {
+        setPendingNotice({ submission, conversation });
+        return;
+      }
     }
+    void performSend(submission);
   };
 
   const regenerate = () => {
-    if (!conversation || activeRef.current.has(conversation.id)) return;
+    if (
+      !conversation ||
+      conversation.id !== selectedIdRef.current ||
+      loadingConversationRef.current ||
+      selectionMutationPendingRef.current ||
+      activeRef.current.has(conversation.id)
+    )
+      return;
     const latest = conversation.messages.at(-1);
     if (!latest || latest.role !== "assistant" || latest.status === "streaming") return;
     const priorUser = [...conversation.messages]
@@ -1196,7 +1604,14 @@ export default function App() {
   };
 
   const retryGeneration = () => {
-    if (!conversation || activeRef.current.has(conversation.id)) return;
+    if (
+      !conversation ||
+      conversation.id !== selectedIdRef.current ||
+      loadingConversationRef.current ||
+      selectionMutationPendingRef.current ||
+      activeRef.current.has(conversation.id)
+    )
+      return;
     const latest = conversation.messages.at(-1);
     if (!latest || latest.status === "streaming") return;
     if (latest.role === "user") {
@@ -1211,21 +1626,98 @@ export default function App() {
     }
   };
 
-  const promptSaveKey = async () => {
+  const promptSaveKey = async (providerId: ProviderId) => {
     if (runtime !== "tauri") throw new Error("API key setup is available only in the desktop app.");
-    const next = await assistantAdapter.promptStoreApiKey();
-    if (next.cancelled) {
-      setToast("API key setup cancelled");
-      return;
+    setCredentialWorkingProvider(providerId);
+    try {
+      const next = await assistantAdapter.promptStoreApiKey(providerId);
+      if (next.cancelled) {
+        setToast("API key setup cancelled");
+        return;
+      }
+      setProviderStatuses(await assistantAdapter.providerStatuses());
+      setToast("API key saved in Windows Credential Manager");
+    } finally {
+      setCredentialWorkingProvider(null);
     }
-    setCredential({ configured: next.configured, source: next.source });
-    setToast("API key saved in Windows Credential Manager");
   };
 
-  const deleteKey = async () => {
-    const next = await assistantAdapter.deleteApiKey();
-    setCredential(next);
+  const deleteKey = async (providerId: ProviderId) => {
+    if (runtime !== "tauri")
+      throw new Error("API key removal is available only in the desktop app.");
+    await assistantAdapter.deleteApiKey(providerId);
+    setProviderStatuses(await assistantAdapter.providerStatuses());
     setToast("Saved API key removed");
+  };
+
+  const chooseModel = async (selection: ModelSelection) => {
+    setModelPickerOpen(false);
+    if (!conversation) {
+      if (selectedIdRef.current === null && !loadingConversationRef.current) {
+        await createConversation(selection, { preserveDraft: true });
+      }
+      return;
+    }
+    if (
+      conversation.id !== selectedIdRef.current ||
+      loadingConversationRef.current ||
+      selectionMutationPendingRef.current
+    )
+      return;
+    const currentSelection = {
+      providerId: conversation.providerId,
+      modelId: conversation.modelId,
+    } as ModelSelection;
+    if (sameSelection(currentSelection, selection)) return;
+    if (conversation.messages.length > 0) {
+      setPendingModelChange(selection);
+      return;
+    }
+    const targetConversationId = conversation.id;
+    conversationIntentVersionRef.current += 1;
+    const mutationVersion = ++selectionMutationVersionRef.current;
+    selectionMutationPendingRef.current = true;
+    setUpdatingConversationSelection(true);
+    try {
+      const updated = await assistantAdapter.updateConversationSelection(
+        targetConversationId,
+        selection.providerId,
+        selection.modelId,
+      );
+      if (
+        mutationVersion !== selectionMutationVersionRef.current ||
+        selectedIdRef.current !== targetConversationId
+      )
+        return;
+      setConversation(updated);
+      setMode(updated.responseProfile);
+      updateSummaries((current) =>
+        current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)),
+      );
+      setToast(
+        `Model changed to ${catalog ? selectionLabel(catalog, selection) : selection.modelId}`,
+      );
+    } catch (error) {
+      if (mutationVersion === selectionMutationVersionRef.current) {
+        setToast(publicError(error).message);
+      }
+    } finally {
+      if (mutationVersion === selectionMutationVersionRef.current) {
+        selectionMutationPendingRef.current = false;
+        setUpdatingConversationSelection(false);
+      }
+    }
+  };
+
+  const confirmModelChange = async () => {
+    if (!pendingModelChange) return;
+    setChangingModel(true);
+    try {
+      const next = await createConversation(pendingModelChange);
+      if (next) setPendingModelChange(null);
+    } finally {
+      setChangingModel(false);
+    }
   };
 
   const importConversations = async () => {
@@ -1281,27 +1773,80 @@ export default function App() {
   };
 
   const active = selectedId ? activeByConversation[selectedId] : undefined;
+  const authoritativeConversation =
+    conversation?.id === selectedId && !loadingConversation ? conversation : null;
   const visibleGenerationError =
-    conversation && generationError?.conversationId === conversation.id
+    authoritativeConversation && generationError?.conversationId === authoritativeConversation.id
       ? generationError.error
       : null;
-  const lastMessage = conversation?.messages.at(-1);
+  const lastMessage = authoritativeConversation?.messages.at(-1);
   const canRegenerate =
-    lastMessage?.role === "assistant" && lastMessage.status !== "streaming" && !active;
+    lastMessage?.role === "assistant" &&
+    lastMessage.status !== "streaming" &&
+    !active &&
+    !updatingConversationSelection;
+  const currentSelection = catalog
+    ? authoritativeConversation
+      ? ({
+          providerId: authoritativeConversation.providerId,
+          modelId: authoritativeConversation.modelId,
+        } as ModelSelection)
+      : selectedId === null && !loadingConversation
+        ? catalog.defaultSelection
+        : null
+    : null;
+  const currentProvider = catalog?.providers.find(
+    (provider) => provider.id === currentSelection?.providerId,
+  );
+  const currentModel = currentProvider?.models.find(
+    (model) => model.id === currentSelection?.modelId,
+  );
+  const currentProviderStatus = providerStatuses.find(
+    (status) => status.providerId === currentSelection?.providerId,
+  );
+  const pendingNoticeProvider = catalog?.providers.find(
+    (provider) => provider.id === pendingNotice?.conversation.providerId,
+  );
+  const pendingNoticeModel = pendingNoticeProvider?.models.find(
+    (model) => model.id === pendingNotice?.conversation.modelId,
+  );
   const connectionLabel =
     runtime === "browser-demo"
       ? "Demo"
-      : appStatus.providerReachability === "reachable"
+      : currentProviderStatus?.reachability === "reachable"
         ? "Reachable"
-        : appStatus.providerReachability === "unreachable"
+        : currentProviderStatus?.reachability === "unreachable"
           ? "Unreachable"
           : "Not checked";
   const connectionClass =
-    appStatus.providerReachability === "reachable"
+    currentProviderStatus?.reachability === "reachable"
       ? "online"
-      : appStatus.providerReachability === "unreachable"
+      : currentProviderStatus?.reachability === "unreachable"
         ? "offline"
         : "unknown";
+
+  const continuePendingNotice = () => {
+    if (!pendingNotice) return;
+    const consent = pendingNotice;
+    setAcknowledgingExternal(true);
+    void assistantAdapter
+      .acknowledgeExternalProcessing(consent.conversation.providerId)
+      .then(async () => {
+        setPendingNotice(null);
+        setProviderStatuses(await assistantAdapter.providerStatuses());
+        conversationIntentVersionRef.current += 1;
+        selectedIdRef.current = consent.conversation.id;
+        setSelectedId(consent.conversation.id);
+        setConversation(consent.conversation);
+        void performSend(consent.submission, consent.conversation);
+      })
+      .catch((error: unknown) => {
+        setToast(publicError(error).message);
+      })
+      .finally(() => {
+        setAcknowledgingExternal(false);
+      });
+  };
 
   return (
     <div className="app-shell">
@@ -1406,6 +1951,12 @@ export default function App() {
             <button
               data-new-chat
               className="nav-button new-chat"
+              disabled={
+                selectedId !== null &&
+                (loadingConversation ||
+                  updatingConversationSelection ||
+                  conversation?.id !== selectedId)
+              }
               type="button"
               onClick={() => void createConversation()}
             >
@@ -1424,6 +1975,18 @@ export default function App() {
               <Icon name="search" size={17} />
               <span>Search titles</span>
               <kbd>Ctrl K</kbd>
+            </button>
+            <button
+              className="nav-button"
+              type="button"
+              onClick={() => {
+                setUsageOpen(true);
+                setSidebarOpen(false);
+              }}
+            >
+              <Icon name="history" size={17} />
+              <span>Usage</span>
+              <small>7 days</small>
             </button>
           </div>
           {searchOpen && (
@@ -1582,9 +2145,7 @@ export default function App() {
                 <small>
                   {runtime === "browser-demo"
                     ? "Demo mode"
-                    : credential.configured
-                      ? "Z.AI connected"
-                      : "Setup required"}
+                    : `${String(providerStatuses.filter((status) => status.configured).length)} provider keys configured`}
                 </small>
               </span>
               <Icon name="settings" size={17} />
@@ -1608,7 +2169,9 @@ export default function App() {
               <h1>{conversation?.title ?? "New conversation"}</h1>
               {conversation && (
                 <span>
-                  {conversation.model ?? "glm-5.1"} · {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                  {currentProvider?.displayName ?? conversation.providerId} ·{" "}
+                  {currentModel?.displayName ?? conversation.modelId} ·{" "}
+                  {mode.charAt(0).toUpperCase() + mode.slice(1)}
                 </span>
               )}
             </div>
@@ -1724,7 +2287,9 @@ export default function App() {
                               <span />
                               <span />
                               <span />{" "}
-                              {active?.state === "connecting" ? "Connecting securely" : "Thinking"}
+                              {active?.state === "connecting"
+                                ? "Connecting to provider"
+                                : "Thinking"}
                             </div>
                           ) : (
                             <Markdown
@@ -1747,6 +2312,7 @@ export default function App() {
                               }}
                             />
                           )}
+                          <MessageFinishNotice finishReason={message.finishReason} />
                           <div className="message-meta">
                             <span>
                               {message.status === "streaming"
@@ -1816,49 +2382,66 @@ export default function App() {
             </div>
           )}
 
-          <Composer
-            active={active}
-            credentialConfigured={credential.configured}
-            draft={draft}
-            editing={editing}
-            mode={mode}
-            providerUnreachable={
-              runtime === "tauri" && appStatus.providerReachability === "unreachable"
-            }
-            onCancelEdit={() => {
-              setEditing(null);
-              setDraft("");
-              textareaRef.current?.focus();
-            }}
-            onChange={setDraft}
-            onModeChange={setMode}
-            onOpenSettings={() => {
-              setSettingsOpen(true);
-            }}
-            onStop={stopGeneration}
-            onSubmit={requestSubmit}
-            runtime={runtime}
-            textareaRef={textareaRef}
-          />
+          {catalog && currentSelection && currentProvider && currentModel && (
+            <Composer
+              active={active}
+              credentialConfigured={
+                runtime === "browser-demo" || currentProviderStatus?.configured === true
+              }
+              draft={draft}
+              editing={editing}
+              interactionDisabled={updatingConversationSelection}
+              mode={mode}
+              model={currentModel}
+              modelLabel={selectionLabel(catalog, currentSelection)}
+              providerName={currentProvider.displayName}
+              providerUnreachable={
+                runtime === "tauri" && currentProviderStatus?.reachability === "unreachable"
+              }
+              onCancelEdit={() => {
+                setEditing(null);
+                setDraft("");
+                textareaRef.current?.focus();
+              }}
+              onChange={setDraft}
+              onModeChange={setMode}
+              onOpenModelPicker={() => {
+                setModelPickerOpen(true);
+              }}
+              onOpenSettings={() => {
+                setSettingsOpen(true);
+              }}
+              onStop={stopGeneration}
+              onSubmit={requestSubmit}
+              runtime={runtime}
+              textareaRef={textareaRef}
+            />
+          )}
         </main>
       </div>
 
-      {settingsOpen && (
+      {settingsOpen && catalog && (
         <SettingsDialog
           appStatus={appStatus}
-          credential={credential}
+          catalog={catalog}
           currentConversation={conversation}
+          providerStatuses={providerStatuses}
+          workingProviderId={credentialWorkingProvider}
           onClose={() => {
             setSettingsOpen(false);
           }}
-          onRequestDeleteKey={() => {
+          onPromptCredential={(providerId) => {
+            void promptSaveKey(providerId).catch((error: unknown) => {
+              setToast(publicError(error).message);
+            });
+          }}
+          onRequestDeleteKey={(providerId) => {
             setSettingsOpen(false);
-            setConfirmKeyRemoval(true);
+            setConfirmKeyRemoval(providerId);
           }}
           onExport={exportConversation}
           onImport={importConversations}
           onImportFile={importDemoFile}
-          onPromptSaveKey={promptSaveKey}
           runtime={runtime}
         />
       )}
@@ -1866,9 +2449,9 @@ export default function App() {
       {confirmKeyRemoval && (
         <Dialog
           label="Remove saved API key?"
-          description="Aster will delete the Z.AI credential from Windows Credential Manager. You will not be able to send another provider request until a new key is saved."
+          description={`Aster will delete the ${catalog?.providers.find((provider) => provider.id === confirmKeyRemoval)?.displayName ?? confirmKeyRemoval} credential from Windows Credential Manager. Requests to this provider will require a new key.`}
           onClose={() => {
-            setConfirmKeyRemoval(false);
+            setConfirmKeyRemoval(null);
             setSettingsOpen(true);
           }}
           size="small"
@@ -1883,7 +2466,7 @@ export default function App() {
               disabled={removingKey}
               type="button"
               onClick={() => {
-                setConfirmKeyRemoval(false);
+                setConfirmKeyRemoval(null);
                 setSettingsOpen(true);
               }}
             >
@@ -1894,10 +2477,11 @@ export default function App() {
               disabled={removingKey}
               type="button"
               onClick={() => {
+                const providerId = confirmKeyRemoval;
                 setRemovingKey(true);
-                void deleteKey()
+                void deleteKey(providerId)
                   .then(() => {
-                    setConfirmKeyRemoval(false);
+                    setConfirmKeyRemoval(null);
                     setSettingsOpen(true);
                   })
                   .catch((error: unknown) => {
@@ -1991,70 +2575,71 @@ export default function App() {
         </Dialog>
       )}
 
-      {pendingNotice && (
-        <Dialog
-          label="Before your first message"
-          description="Review how your conversation is processed."
+      {modelPickerOpen && catalog && currentSelection && (
+        <ModelPickerDialog
+          catalog={catalog}
+          currentSelection={currentSelection}
+          onChoose={(selection) => void chooseModel(selection)}
           onClose={() => {
+            setModelPickerOpen(false);
+          }}
+          providerStatuses={providerStatuses}
+        />
+      )}
+
+      {pendingModelChange && catalog && conversation && (
+        <ModelChangeDialog
+          catalog={catalog}
+          currentSelection={
+            {
+              providerId: conversation.providerId,
+              modelId: conversation.modelId,
+            } as ModelSelection
+          }
+          onCancel={() => {
+            setPendingModelChange(null);
+          }}
+          onConfirm={() => {
+            void confirmModelChange();
+          }}
+          requestedSelection={pendingModelChange}
+          working={changingModel}
+        />
+      )}
+
+      {usageOpen && catalog && currentSelection && (
+        <UsageDialog
+          catalog={catalog}
+          initialProviderId={currentSelection.providerId}
+          loadDeepSeekBalance={loadDeepSeekBalanceForDialog}
+          loadUsage={loadUsageForDialog}
+          onClose={() => {
+            setUsageOpen(false);
+          }}
+          openProviderAccount={desktopAdapter ? openProviderAccountForDialog : undefined}
+          providerStatuses={providerStatuses}
+          refreshDeepSeekBalance={refreshDeepSeekBalanceForDialog}
+          runtime={runtime}
+          setBudget={setUsageBudgetForDialog}
+        />
+      )}
+
+      {pendingNotice && pendingNoticeProvider && pendingNoticeModel && (
+        <ProviderConsentDialog
+          modelName={pendingNoticeModel.displayName}
+          onCancel={() => {
             if (!acknowledgingExternal) setPendingNotice(null);
           }}
-          size="small"
-        >
-          <div className="provider-notice">
-            <div className="notice-icon">
-              <Icon name="shield" size={22} />
-            </div>
-            <div>
-              <h3>Messages are processed by Z.AI</h3>
-              <p>
-                Your message and relevant conversation context will leave this device. Do not send
-                secrets or sensitive data without reviewing Z.AI’s policies.
-              </p>
-            </div>
-          </div>
-          <p className="local-disclosure">
-            Conversation history is also stored locally in SQLite and is not synchronized by Aster.
-          </p>
-          <div className="dialog-actions">
-            <button
-              className="button secondary"
-              disabled={acknowledgingExternal}
-              type="button"
-              onClick={() => {
-                setPendingNotice(null);
-              }}
-            >
-              Go back
-            </button>
-            <button
-              className="button primary"
-              disabled={acknowledgingExternal}
-              type="button"
-              onClick={() => {
-                const consent = pendingNotice;
-                setAcknowledgingExternal(true);
-                void assistantAdapter
-                  .acknowledgeExternalProcessing()
-                  .then(() => {
-                    setPendingNotice(null);
-                    setExternalNoticeAccepted(true);
-                    selectedIdRef.current = consent.conversation.id;
-                    setSelectedId(consent.conversation.id);
-                    setConversation(consent.conversation);
-                    void performSend(consent.submission, consent.conversation);
-                  })
-                  .catch((error: unknown) => {
-                    setToast(publicError(error).message);
-                  })
-                  .finally(() => {
-                    setAcknowledgingExternal(false);
-                  });
-              }}
-            >
-              {acknowledgingExternal ? "Confirming…" : "Continue and send"}
-            </button>
-          </div>
-        </Dialog>
+          onContinue={continuePendingNotice}
+          provider={pendingNoticeProvider}
+          selection={
+            {
+              providerId: pendingNotice.conversation.providerId,
+              modelId: pendingNotice.conversation.modelId,
+            } as ModelSelection
+          }
+          working={acknowledgingExternal}
+        />
       )}
 
       <div className="toast-region" aria-live="polite" aria-atomic="true">

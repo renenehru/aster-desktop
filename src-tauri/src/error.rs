@@ -19,6 +19,8 @@ pub enum AppError {
     NotFound(&'static str),
     #[error("operation conflicts with current state")]
     Conflict(&'static str),
+    #[error("the conversation provider and model are locked")]
+    ConversationModelLocked,
     #[error("external processing notice has not been acknowledged")]
     ExternalProcessingNoticeRequired,
     #[error("the API key is not configured")]
@@ -45,6 +47,10 @@ pub enum AppError {
     ProviderContentRejected,
     #[error("provider context limit was exceeded")]
     ProviderContextLimit,
+    #[error("provider requested an unsupported capability")]
+    UnsupportedProviderCapability,
+    #[error("provider balance response was malformed")]
+    MalformedBalance,
     #[error("network request failed")]
     Network,
     #[error("network request timed out")]
@@ -85,6 +91,11 @@ impl AppError {
                 message,
                 retryable: false,
             },
+            Self::ConversationModelLocked => PublicError {
+                code: "conversation_model_locked",
+                message: "This conversation already has messages. Start a new chat to use another model.",
+                retryable: false,
+            },
             Self::ExternalProcessingNoticeRequired => PublicError {
                 code: "external_processing_notice_required",
                 message: "Review and acknowledge the external-processing notice before sending.",
@@ -92,7 +103,7 @@ impl AppError {
             },
             Self::CredentialNotConfigured => PublicError {
                 code: "credential_not_configured",
-                message: "Add your Z.AI API key in Settings before sending a message.",
+                message: "Add the selected provider's API key in Settings before sending a message.",
                 retryable: false,
             },
             Self::CredentialVault => PublicError {
@@ -117,52 +128,62 @@ impl AppError {
             },
             Self::ProviderAuthentication => PublicError {
                 code: "provider_authentication_failed",
-                message: "Z.AI rejected the API key. Replace it in Settings and try again.",
+                message: "The selected provider rejected its API key. Replace it in Settings and try again.",
                 retryable: false,
             },
             Self::ProviderRateLimited => PublicError {
                 code: "provider_rate_limited",
-                message: "Z.AI is rate limiting requests. Wait briefly and try again.",
+                message: "The selected provider is rate limiting requests. Wait briefly and try again.",
                 retryable: true,
             },
             Self::ProviderUnavailable => PublicError {
                 code: "provider_unavailable",
-                message: "Z.AI is temporarily unavailable. Try again shortly.",
+                message: "The selected provider is temporarily unavailable. Try again shortly.",
                 retryable: true,
             },
             Self::ProviderRejected => PublicError {
                 code: "provider_rejected_request",
-                message: "Z.AI rejected this request. Review the message and reasoning mode.",
+                message: "The selected provider rejected this request. Review the message and response profile.",
                 retryable: false,
             },
             Self::ProviderContract => PublicError {
                 code: "provider_contract_rejected",
-                message: "Z.AI rejected Aster's verified glm-5.1 request contract.",
+                message: "The selected provider rejected Aster's verified request contract.",
                 retryable: false,
             },
             Self::ProviderContentRejected => PublicError {
                 code: "provider_content_rejected",
-                message: "Z.AI stopped this response because of its content policy.",
+                message: "The selected provider stopped this response because of its content policy.",
                 retryable: false,
             },
             Self::ProviderContextLimit => PublicError {
                 code: "provider_context_limit",
-                message: "This conversation exceeds Z.AI's context limit. Start a new conversation.",
+                message: "This conversation exceeds the selected provider's context limit. Start a new conversation.",
                 retryable: false,
+            },
+            Self::UnsupportedProviderCapability => PublicError {
+                code: "unsupported_provider_capability",
+                message: "The provider attempted a capability that Aster does not support.",
+                retryable: false,
+            },
+            Self::MalformedBalance => PublicError {
+                code: "malformed_balance",
+                message: "DeepSeek returned invalid balance data.",
+                retryable: true,
             },
             Self::Network => PublicError {
                 code: "network_error",
-                message: "A secure connection to Z.AI could not be established.",
+                message: "A secure connection to the selected provider could not be established.",
                 retryable: true,
             },
             Self::Timeout => PublicError {
                 code: "request_timeout",
-                message: "The Z.AI request timed out. Try again.",
+                message: "The provider request timed out. Try again.",
                 retryable: true,
             },
             Self::MalformedStream => PublicError {
                 code: "malformed_stream",
-                message: "Z.AI returned an invalid or incomplete response stream.",
+                message: "The selected provider returned an invalid or incomplete response stream.",
                 retryable: true,
             },
             Self::Cancelled => PublicError {

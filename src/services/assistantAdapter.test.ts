@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { BrowserDemoAdapter } from "./assistantAdapter";
+import { BrowserDemoAdapter, deriveDemoAdvisoryBudget } from "./assistantAdapter";
 import type { ChatStreamEvent } from "../types/chat";
 
 const defaultDemoResponse = [
@@ -11,7 +11,7 @@ const defaultDemoResponse = [
   "- Keep trust boundaries explicit.",
   "- Verify failure states as carefully as the happy path.",
   "",
-  "This browser preview uses an **in-memory demo adapter**. The desktop build routes requests through secure Tauri IPC.",
+  "The **standard** response profile is active. This browser preview is synthetic and in memory only.",
 ].join("\n");
 
 function validConversation(title = "Imported conversation") {
@@ -46,23 +46,21 @@ describe("BrowserDemoAdapter", () => {
     const adapter = new BrowserDemoAdapter([]);
     await expect(adapter.appStatus()).resolves.toMatchObject({
       mode: "demo",
-      version: "0.1.0-preview",
+      version: "0.2.0-preview",
       databaseReady: true,
     });
-    await expect(adapter.credentialStatus()).resolves.toEqual({
-      configured: false,
-      source: "none",
-    });
-    await expect(adapter.promptStoreApiKey()).rejects.toThrow("available only in the desktop app");
-    await expect(adapter.deleteApiKey()).resolves.toEqual({ configured: false, source: "none" });
+    await expect(adapter.modelCatalog()).resolves.toMatchObject({ version: 2 });
+    await expect(adapter.providerStatuses()).resolves.toHaveLength(5);
+    expect("promptStoreApiKey" in adapter).toBe(false);
+    expect("deleteApiKey" in adapter).toBe(false);
+    expect("openProviderAccount" in adapter).toBe(false);
   });
 
-  it("opens only public credential-free HTTPS destinations", async () => {
+  it("never opens any external destination in browser demo", async () => {
     const adapter = new BrowserDemoAdapter([]);
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
-    await expect(adapter.openExternalUrl("https://example.com/guide")).resolves.toBeUndefined();
-    expect(open).toHaveBeenCalledWith("https://example.com/guide", "_blank", "noopener,noreferrer");
     for (const rejected of [
+      "https://example.com/guide",
       "javascript:alert(1)",
       "data:text/html,unsafe",
       "https://localhost/admin",
@@ -75,7 +73,19 @@ describe("BrowserDemoAdapter", () => {
     ]) {
       await expect(adapter.openExternalUrl(rejected)).rejects.toThrow();
     }
-    expect(open).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("uses exact integer arithmetic for a near-threshold max-safe token budget", () => {
+    const tokenBudget = 9_007_199_254_740_989;
+    const knownUsedTokens = 8_106_479_329_266_890;
+
+    expect(deriveDemoAdvisoryBudget(tokenBudget, knownUsedTokens)).toMatchObject({
+      tokenBudget,
+      knownUsedTokens,
+      remainingTokens: 900_719_925_474_099,
+      state: "normal",
+    });
   });
 
   it("supports isolated conversation CRUD with bounded titles", async () => {
@@ -112,7 +122,7 @@ describe("BrowserDemoAdapter", () => {
     await adapter.sendMessage({
       conversationId: conversation.id,
       content: "Explain a clear plan 🚀",
-      reasoningMode: "standard",
+      responseProfile: "standard",
     });
     await vi.runAllTimersAsync();
 
@@ -124,8 +134,12 @@ describe("BrowserDemoAdapter", () => {
     expect(events[0]?.kind).toBe("started");
     expect(deltas).toBe(defaultDemoResponse);
     expect(completed?.message?.content).toBe(defaultDemoResponse);
+    expect(completed?.message?.finishReason).toBe("stop");
     expect((await adapter.getConversation(conversation.id)).messages.at(-1)?.content).toBe(
       defaultDemoResponse,
+    );
+    expect((await adapter.getConversation(conversation.id)).messages.at(-1)?.finishReason).toBe(
+      "stop",
     );
 
     unsubscribe();
@@ -139,7 +153,7 @@ describe("BrowserDemoAdapter", () => {
     const { requestId } = await adapter.sendMessage({
       conversationId: conversation.id,
       content: "Review a security incident",
-      reasoningMode: "deep",
+      responseProfile: "deep",
     });
 
     await vi.advanceTimersByTimeAsync(170);
@@ -160,7 +174,7 @@ describe("BrowserDemoAdapter", () => {
     await adapter.sendMessage({
       conversationId: conversation.id,
       content: "Write code",
-      reasoningMode: "fast",
+      responseProfile: "fast",
     });
     await vi.runAllTimersAsync();
     const initial = await adapter.getConversation(conversation.id);
@@ -172,7 +186,7 @@ describe("BrowserDemoAdapter", () => {
     await adapter.sendMessage({
       conversationId: conversation.id,
       content: "Review a threat instead",
-      reasoningMode: "deep",
+      responseProfile: "deep",
       regenerateFromMessageId: user?.id,
     });
     await vi.runAllTimersAsync();
@@ -183,7 +197,7 @@ describe("BrowserDemoAdapter", () => {
     await adapter.sendMessage({
       conversationId: conversation.id,
       content: "Review a threat instead",
-      reasoningMode: "standard",
+      responseProfile: "standard",
       regenerateFromMessageId: edited.messages[1]?.id,
     });
     await vi.runAllTimersAsync();
@@ -199,14 +213,14 @@ describe("BrowserDemoAdapter", () => {
       adapter.sendMessage({
         conversationId: "missing",
         content: "Hello",
-        reasoningMode: "standard",
+        responseProfile: "standard",
       }),
     ).rejects.toThrow("not found");
     await expect(async () =>
       adapter.sendMessage({
         conversationId: conversation.id,
         content: "Hello",
-        reasoningMode: "standard",
+        responseProfile: "standard",
         regenerateFromMessageId: "missing-message",
       }),
     ).rejects.toThrow("not found");
@@ -214,21 +228,21 @@ describe("BrowserDemoAdapter", () => {
     await adapter.sendMessage({
       conversationId: conversation.id,
       content: "First prompt",
-      reasoningMode: "standard",
+      responseProfile: "standard",
     });
     await vi.runAllTimersAsync();
     const firstAnswer = (await adapter.getConversation(conversation.id)).messages[1];
     await adapter.sendMessage({
       conversationId: conversation.id,
       content: "Second prompt",
-      reasoningMode: "standard",
+      responseProfile: "standard",
     });
     await vi.runAllTimersAsync();
     await expect(async () =>
       adapter.sendMessage({
         conversationId: conversation.id,
         content: "First prompt",
-        reasoningMode: "standard",
+        responseProfile: "standard",
         regenerateFromMessageId: firstAnswer?.id,
       }),
     ).rejects.toThrow("latest response");
@@ -240,7 +254,7 @@ describe("BrowserDemoAdapter", () => {
     await source.sendMessage({
       conversationId: conversation.id,
       content: "Create an export",
-      reasoningMode: "standard",
+      responseProfile: "standard",
     });
     await vi.runAllTimersAsync();
     const serialized = await source.exportConversation(conversation.id);
@@ -255,7 +269,114 @@ describe("BrowserDemoAdapter", () => {
       conversationId: restored.id,
       role: "assistant",
       status: "complete",
+      finishReason: "stop",
     });
+  });
+
+  it("maps a legacy completed assistant message to an unknown finish reason", async () => {
+    const adapter = new BrowserDemoAdapter([]);
+    const imported = await adapter.importConversations(
+      JSON.stringify({
+        format: "aster-conversation",
+        version: 1,
+        exportedAt: "2026-07-11T12:00:00.000Z",
+        conversations: [validConversation()],
+      }),
+    );
+
+    const restored = await adapter.getConversation(imported[0]?.id ?? "");
+    expect(restored.messages[0]).toMatchObject({
+      role: "assistant",
+      status: "complete",
+      finishReason: "unknown",
+      usage: {
+        inputTokens: null,
+        cachedInputTokens: null,
+        outputTokens: null,
+        totalTokens: 12,
+      },
+    });
+  });
+
+  it("maps a v2 imported completed assistant without terminal evidence to unknown", async () => {
+    const adapter = new BrowserDemoAdapter([]);
+    const imported = await adapter.importConversations(
+      JSON.stringify({
+        format: "aster-conversation",
+        version: 2,
+        exportedAt: "2026-07-11T12:00:00.000Z",
+        conversations: [
+          {
+            title: "Imported v2 conversation",
+            provider: "zai",
+            model: "glm-5.1",
+            responseProfile: "standard",
+            createdAt: "2026-07-11T12:00:00.000Z",
+            updatedAt: "2026-07-11T12:00:00.000Z",
+            messages: [
+              {
+                role: "assistant",
+                content: "Imported without authoritative terminal evidence.",
+                createdAt: "2026-07-11T12:00:00.000Z",
+                status: "complete",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const restored = await adapter.getConversation(imported[0]?.id ?? "");
+    expect(restored.messages[0]).toMatchObject({
+      role: "assistant",
+      status: "complete",
+      finishReason: "unknown",
+    });
+  });
+
+  it("never infers a finish reason for imported user, cancelled, or error messages", async () => {
+    const adapter = new BrowserDemoAdapter([]);
+    const imported = await adapter.importConversations(
+      JSON.stringify({
+        format: "aster-conversation",
+        version: 2,
+        exportedAt: "2026-07-11T12:00:00.000Z",
+        conversations: [
+          {
+            title: "Imported terminal states",
+            provider: "zai",
+            model: "glm-5.1",
+            responseProfile: "standard",
+            createdAt: "2026-07-11T12:00:00.000Z",
+            updatedAt: "2026-07-11T12:00:00.000Z",
+            messages: [
+              {
+                role: "user",
+                content: "User message",
+                createdAt: "2026-07-11T12:00:00.000Z",
+                status: "complete",
+              },
+              {
+                role: "assistant",
+                content: "Cancelled response",
+                createdAt: "2026-07-11T12:00:01.000Z",
+                status: "cancelled",
+              },
+              {
+                role: "assistant",
+                content: "Failed response",
+                createdAt: "2026-07-11T12:00:02.000Z",
+                status: "error",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const restored = await adapter.getConversation(imported[0]?.id ?? "");
+    expect(restored.messages).toHaveLength(3);
+    expect(restored.messages.every((message) => !("finishReason" in message))).toBe(true);
   });
 
   it.each([
@@ -307,7 +428,7 @@ describe("BrowserDemoAdapter", () => {
     });
 
     await expect(async () => adapter.importConversations(invalidBundle)).rejects.toThrow(
-      "unsupported message role",
+      "Unsupported message role",
     );
     await expect(adapter.listConversations()).resolves.toEqual([]);
   });

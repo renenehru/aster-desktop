@@ -6,6 +6,10 @@
 
 **Decision owners:** `SEC-017`, `SEC-021`, `SEC-030`, `SEC-039`
 
+**MVP v2 applicability:** Adopted unchanged. Every exclusion and least-privilege
+control below remains active for MVP v2 even where the historical decision text
+says MVP v1.
+
 ## Context
 
 The source plan discussed projects, local files, attachments, document processing, and model-invoked tools. Each would add new privileged data flows, parsers, permissions, prompt-injection paths, and destructive-action risks. They are not required to prove the direct chat lifecycle.

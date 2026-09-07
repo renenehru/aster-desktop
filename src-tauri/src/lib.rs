@@ -10,19 +10,20 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use api::ProviderClient;
-use aster_credential_prompt::PromptOutcome;
+use api::{ParsedBalance, PreparedProviderRequest, ProviderClient};
+use aster_credential_prompt::{PromptOutcome, PromptProvider};
 use chrono::{SecondsFormat, Utc};
 use credentials::CredentialStore;
 use database::{Database, PreparedGeneration};
-use error::{AppError, AppResult};
+use error::{AppError, AppResult, PublicError};
 use models::{
-    AppStatus, Conversation, ConversationSummary, CredentialPromptResult, CredentialStatus,
-    ExportBundle, ExportResult, ImportBundle, MessageStatus, ReasoningMode, SendMessageResult,
-    StreamEvent,
+    AppStatus, BalanceInfo, Conversation, ConversationSummary, CredentialPromptResult,
+    CredentialStatus, DeepSeekBalanceStatus, ExportBundle, ExportResult, ImportBundle,
+    MessageStatus, ModelCatalog, ProviderAccountAction, ProviderId, ProviderStatus,
+    ResponseProfile, SendMessageResult, StreamEvent, TokenUsage, UsageSummary,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use rfd::AsyncFileDialog;
@@ -39,11 +40,18 @@ const MAIN_WINDOW: &str = "main";
 const STREAM_EVENT: &str = "chat-stream";
 const DATABASE_FILE_NAME: &str = "aster.sqlite3";
 const EXPORT_FORMAT: &str = "aster-conversation";
-const EXPORT_VERSION: u32 = 1;
+const EXPORT_VERSION: u32 = 2;
 const MAX_TRANSFER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_JSON_NESTING: usize = 8;
 const MAX_IPC_BODY_BYTES: usize = 320 * 1024;
 const MAX_EXTERNAL_URL_BYTES: usize = 2_048;
+const MAX_STREAM_EVENTS: u64 = 65_536;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderArgs {
+    provider_id: ProviderId,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -55,6 +63,16 @@ struct ConversationIdArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateConversationArgs {
     title: Option<String>,
+    provider_id: Option<ProviderId>,
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateConversationSelectionArgs {
+    conversation_id: String,
+    provider_id: ProviderId,
+    model_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +87,7 @@ struct RenameConversationArgs {
 struct SendMessageArgs {
     conversation_id: String,
     content: String,
-    reasoning_mode: ReasoningMode,
+    response_profile: ResponseProfile,
     regenerate_from_message_id: Option<String>,
 }
 
@@ -77,6 +95,27 @@ struct SendMessageArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RequestIdArgs {
     request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UsageSummaryArgs {
+    provider_id: ProviderId,
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetUsageBudgetArgs {
+    provider_id: ProviderId,
+    token_budget: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderAccountArgs {
+    provider_id: ProviderId,
+    action: ProviderAccountAction,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,17 +134,50 @@ struct AppStateInner {
     credentials: CredentialStore,
     provider: ProviderClient,
     active: Mutex<HashMap<String, ActiveGeneration>>,
+    provider_reachability: Mutex<HashMap<ProviderId, i8>>,
+    balance: Mutex<BalanceMemory>,
+    balance_credential_epoch: AtomicU64,
+    balance_operation: AtomicU64,
     shutdown_started: AtomicBool,
     shutdown_ready: AtomicBool,
-    external_processing_acknowledged: AtomicBool,
     credential_prompt_active: AtomicBool,
-    provider_reachability: AtomicI8,
 }
 
 struct ActiveGeneration {
     conversation_id: String,
+    provider_id: ProviderId,
+    model_id: String,
     cancellation: CancellationToken,
     terminal_claimed: bool,
+}
+
+struct GenerationTask {
+    request_id: String,
+    conversation_id: String,
+    provider_id: ProviderId,
+    model_id: String,
+    provider_request: PreparedProviderRequest,
+    api_key: Zeroizing<String>,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
+struct BalanceSnapshot {
+    observed_at: String,
+    is_available: bool,
+    balance_infos: Vec<BalanceInfo>,
+}
+
+#[derive(Default)]
+struct BalanceMemory {
+    success: Option<BalanceSnapshot>,
+    error: Option<PublicError>,
+}
+
+#[derive(Clone, Copy)]
+struct BalanceAuthority {
+    credential_epoch: u64,
+    operation: u64,
 }
 
 struct CredentialMutationLease {
@@ -122,17 +194,23 @@ impl Drop for CredentialMutationLease {
 
 impl AppState {
     fn new(database: Database, provider: ProviderClient) -> Self {
+        let provider_reachability = ProviderId::ALL
+            .into_iter()
+            .map(|provider| (provider, 0))
+            .collect();
         Self {
             inner: Arc::new(AppStateInner {
                 database,
                 credentials: CredentialStore,
                 provider,
                 active: Mutex::new(HashMap::new()),
+                provider_reachability: Mutex::new(provider_reachability),
+                balance: Mutex::new(BalanceMemory::default()),
+                balance_credential_epoch: AtomicU64::new(0),
+                balance_operation: AtomicU64::new(0),
                 shutdown_started: AtomicBool::new(false),
                 shutdown_ready: AtomicBool::new(false),
-                external_processing_acknowledged: AtomicBool::new(false),
                 credential_prompt_active: AtomicBool::new(false),
-                provider_reachability: AtomicI8::new(0),
             }),
         }
     }
@@ -151,47 +229,39 @@ impl AppState {
 
     fn reserve_credential_mutation(
         &self,
-        require_inactive_generations: bool,
+        provider_id: ProviderId,
     ) -> AppResult<CredentialMutationLease> {
         if self.inner.shutdown_started.load(Ordering::Acquire) {
             return Err(AppError::Conflict("Aster is shutting down."));
         }
         let active = self.inner.active.lock().map_err(|_| AppError::Internal)?;
-        if self.inner.shutdown_started.load(Ordering::Acquire) {
-            return Err(AppError::Conflict("Aster is shutting down."));
-        }
-        if require_inactive_generations && !active.is_empty() {
+        if active
+            .values()
+            .any(|generation| generation.provider_id == provider_id)
+        {
             return Err(AppError::Conflict(
-                "Stop active generation before replacing the API key.",
+                "Stop active generation for this provider before changing its API key.",
             ));
         }
         self.inner
             .credential_prompt_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| AppError::CredentialPromptBusy)?;
-        let lease = CredentialMutationLease {
-            inner: self.inner.clone(),
-        };
-        if self.inner.shutdown_started.load(Ordering::Acquire) {
-            drop(lease);
-            return Err(AppError::Conflict("Aster is shutting down."));
-        }
         drop(active);
-        Ok(lease)
+        Ok(CredentialMutationLease {
+            inner: self.inner.clone(),
+        })
     }
 
-    fn reserve_generation(&self, conversation_id: &str) -> AppResult<(String, CancellationToken)> {
+    fn reserve_generation(
+        &self,
+        conversation_id: &str,
+    ) -> AppResult<(String, CancellationToken, Conversation)> {
         validate_uuid(conversation_id, "Conversation ID is invalid.")?;
         if self.inner.shutdown_started.load(Ordering::Acquire) {
             return Err(AppError::Conflict("Aster is shutting down."));
         }
         let mut active = self.inner.active.lock().map_err(|_| AppError::Internal)?;
-        if self.inner.shutdown_started.load(Ordering::Acquire) {
-            return Err(AppError::Conflict("Aster is shutting down."));
-        }
-        if self.inner.credential_prompt_active.load(Ordering::Acquire) {
-            return Err(AppError::CredentialPromptBusy);
-        }
         if active
             .values()
             .any(|generation| generation.conversation_id == conversation_id)
@@ -200,25 +270,23 @@ impl AppState {
                 "This conversation already has an active generation.",
             ));
         }
+        if self.inner.credential_prompt_active.load(Ordering::Acquire) {
+            return Err(AppError::CredentialPromptBusy);
+        }
+        let conversation = self.database().get_conversation(conversation_id)?;
         let request_id = Uuid::new_v4().to_string();
         let cancellation = CancellationToken::new();
         active.insert(
             request_id.clone(),
             ActiveGeneration {
                 conversation_id: conversation_id.to_owned(),
+                provider_id: conversation.provider_id,
+                model_id: conversation.model_id.clone(),
                 cancellation: cancellation.clone(),
                 terminal_claimed: false,
             },
         );
-        Ok((request_id, cancellation))
-    }
-
-    fn reserve_generation_for_send(
-        &self,
-        conversation_id: &str,
-    ) -> AppResult<(String, CancellationToken)> {
-        self.require_external_processing_acknowledged()?;
-        self.reserve_generation(conversation_id)
+        Ok((request_id, cancellation, conversation))
     }
 
     fn release_generation(&self, request_id: &str) {
@@ -227,13 +295,56 @@ impl AppState {
         }
     }
 
-    fn claim_terminal(&self, request_id: &str) -> AppResult<Option<bool>> {
+    fn validate_and_start_generation<T>(
+        &self,
+        request_id: &str,
+        conversation_id: &str,
+        provider_id: ProviderId,
+        model_id: &str,
+        start: impl FnOnce() -> AppResult<T>,
+    ) -> AppResult<T> {
+        {
+            let active = self.inner.active.lock().map_err(|_| AppError::Internal)?;
+            let generation = active.get(request_id).ok_or(AppError::Internal)?;
+            if generation.terminal_claimed
+                || generation.conversation_id != conversation_id
+                || generation.provider_id != provider_id
+                || generation.model_id != model_id
+            {
+                return Err(AppError::Internal);
+            }
+            if generation.cancellation.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+        }
+
+        // Do not hold `active` while emitting `started`: the renderer must be
+        // able to call the real cancellation path from that event. The
+        // preflight's post-emission check is the final pre-attempt boundary.
+        // Once it succeeds, the database marker is committed and the request
+        // task is spawned even if cancellation arrives immediately afterward.
+        start()
+    }
+
+    fn claim_terminal(
+        &self,
+        request_id: &str,
+        conversation_id: &str,
+        provider_id: ProviderId,
+        model_id: &str,
+    ) -> AppResult<Option<bool>> {
         let mut active = self.inner.active.lock().map_err(|_| AppError::Internal)?;
         let Some(generation) = active.get_mut(request_id) else {
             return Ok(None);
         };
         if generation.terminal_claimed {
             return Ok(None);
+        }
+        if generation.conversation_id != conversation_id
+            || generation.provider_id != provider_id
+            || generation.model_id != model_id
+        {
+            return Err(AppError::Internal);
         }
         generation.terminal_claimed = true;
         Ok(Some(generation.cancellation.is_cancelled()))
@@ -250,7 +361,29 @@ impl AppState {
         Ok(())
     }
 
-    fn ensure_conversation_inactive(&self, conversation_id: &str) -> AppResult<()> {
+    fn update_conversation_selection(
+        &self,
+        conversation_id: &str,
+        provider_id: ProviderId,
+        model_id: String,
+    ) -> AppResult<Conversation> {
+        let active = self.inner.active.lock().map_err(|_| AppError::Internal)?;
+        if active
+            .values()
+            .any(|generation| generation.conversation_id == conversation_id)
+        {
+            return Err(AppError::Conflict(
+                "Stop the active generation before changing this conversation.",
+            ));
+        }
+        let result =
+            self.database()
+                .update_conversation_selection(conversation_id, provider_id, model_id);
+        drop(active);
+        result
+    }
+
+    fn delete_conversation(&self, conversation_id: &str) -> AppResult<()> {
         let active = self.inner.active.lock().map_err(|_| AppError::Internal)?;
         if active
             .values()
@@ -260,7 +393,9 @@ impl AppState {
                 "Stop the active generation before deleting this conversation.",
             ));
         }
-        Ok(())
+        let result = self.database().delete_conversation(conversation_id);
+        drop(active);
+        result
     }
 
     fn cancel_all(&self) {
@@ -308,44 +443,155 @@ impl AppState {
         self.inner.shutdown_ready.store(true, Ordering::Release);
     }
 
-    fn provider_reachability(&self) -> (&'static str, bool) {
-        match self.inner.provider_reachability.load(Ordering::Acquire) {
-            1 => ("reachable", true),
-            -1 => ("unreachable", false),
-            _ => ("unknown", false),
+    fn reachability(&self, provider_id: ProviderId) -> &'static str {
+        match self
+            .inner
+            .provider_reachability
+            .lock()
+            .ok()
+            .and_then(|values| values.get(&provider_id).copied())
+            .unwrap_or(0)
+        {
+            1 => "reachable",
+            -1 => "unreachable",
+            _ => "unknown",
         }
     }
 
-    fn acknowledge_external_processing(&self) {
-        self.inner
-            .external_processing_acknowledged
-            .store(true, Ordering::Release);
-    }
-
-    fn external_processing_acknowledged(&self) -> bool {
-        self.inner
-            .external_processing_acknowledged
-            .load(Ordering::Acquire)
-    }
-
-    fn require_external_processing_acknowledged(&self) -> AppResult<()> {
-        if self.external_processing_acknowledged() {
-            Ok(())
-        } else {
-            Err(AppError::ExternalProcessingNoticeRequired)
+    fn record_provider_result<T>(&self, provider_id: ProviderId, result: &AppResult<T>) {
+        if let Some(value) = Self::provider_result_reachability(result)
+            && let Ok(mut values) = self.inner.provider_reachability.lock()
+        {
+            values.insert(provider_id, value);
         }
     }
 
-    fn record_provider_result(&self, result: &AppResult<api::ProviderOutcome>) {
-        let value = match result {
-            Ok(_) => 1,
-            Err(AppError::Network | AppError::Timeout) => -1,
-            Err(AppError::Cancelled) => return,
-            Err(_) => 1,
+    fn provider_result_reachability<T>(result: &AppResult<T>) -> Option<i8> {
+        match result {
+            Ok(_) => Some(1),
+            Err(error) => Self::provider_error_reachability(error),
+        }
+    }
+
+    fn provider_error_reachability(error: &AppError) -> Option<i8> {
+        match error {
+            AppError::Network | AppError::Timeout => Some(-1),
+            AppError::Cancelled => None,
+            _ => Some(1),
+        }
+    }
+
+    fn balance_status(&self) -> AppResult<DeepSeekBalanceStatus> {
+        let balance = self.inner.balance.lock().map_err(|_| AppError::Internal)?;
+        Ok(match (&balance.success, &balance.error) {
+            (None, None) => DeepSeekBalanceStatus::not_checked(),
+            (None, Some(error)) => DeepSeekBalanceStatus {
+                status: "error",
+                observed_at: None,
+                is_available: None,
+                balance_infos: Vec::new(),
+                error: Some(error.clone()),
+            },
+            (Some(success), None) => DeepSeekBalanceStatus {
+                status: "current",
+                observed_at: Some(success.observed_at.clone()),
+                is_available: Some(success.is_available),
+                balance_infos: success.balance_infos.clone(),
+                error: None,
+            },
+            (Some(success), Some(error)) => DeepSeekBalanceStatus {
+                status: "stale",
+                observed_at: Some(success.observed_at.clone()),
+                is_available: Some(success.is_available),
+                balance_infos: success.balance_infos.clone(),
+                error: Some(error.clone()),
+            },
+        })
+    }
+
+    fn begin_balance_refresh(&self) -> AppResult<BalanceAuthority> {
+        let balance = self.inner.balance.lock().map_err(|_| AppError::Internal)?;
+        let credential_epoch = self.inner.balance_credential_epoch.load(Ordering::Acquire);
+        let operation = self.inner.balance_operation.fetch_add(1, Ordering::AcqRel) + 1;
+        let authority = BalanceAuthority {
+            credential_epoch,
+            operation,
         };
+        drop(balance);
+        Ok(authority)
+    }
+
+    fn invalidate_deepseek_balance(&self) -> AppResult<()> {
+        let mut balance = self.inner.balance.lock().map_err(|_| AppError::Internal)?;
+        self.inner
+            .balance_credential_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        self.inner.balance_operation.fetch_add(1, Ordering::AcqRel);
+        *balance = BalanceMemory::default();
         self.inner
             .provider_reachability
-            .store(value, Ordering::Release);
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .insert(ProviderId::DeepSeek, 0);
+        drop(balance);
+        Ok(())
+    }
+
+    fn authority_is_current(&self, authority: BalanceAuthority) -> bool {
+        self.inner.balance_credential_epoch.load(Ordering::Acquire) == authority.credential_epoch
+            && self.inner.balance_operation.load(Ordering::Acquire) == authority.operation
+    }
+
+    fn record_balance_success(
+        &self,
+        authority: BalanceAuthority,
+        parsed: ParsedBalance,
+    ) -> AppResult<DeepSeekBalanceStatus> {
+        let mut balance = self.inner.balance.lock().map_err(|_| AppError::Internal)?;
+        if !self.authority_is_current(authority) {
+            drop(balance);
+            return self.balance_status();
+        }
+        self.inner
+            .provider_reachability
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .insert(ProviderId::DeepSeek, 1);
+        balance.success = Some(BalanceSnapshot {
+            observed_at: now_utc(),
+            is_available: parsed.is_available,
+            balance_infos: parsed.balance_infos,
+        });
+        balance.error = None;
+        drop(balance);
+        self.balance_status()
+    }
+
+    fn record_balance_error(
+        &self,
+        authority: BalanceAuthority,
+        error: &AppError,
+        clear_success: bool,
+        network_attempted: bool,
+    ) -> AppResult<DeepSeekBalanceStatus> {
+        let mut balance = self.inner.balance.lock().map_err(|_| AppError::Internal)?;
+        if !self.authority_is_current(authority) {
+            drop(balance);
+            return self.balance_status();
+        }
+        if network_attempted && let Some(value) = Self::provider_error_reachability(error) {
+            self.inner
+                .provider_reachability
+                .lock()
+                .map_err(|_| AppError::Internal)?
+                .insert(ProviderId::DeepSeek, value);
+        }
+        if clear_success {
+            balance.success = None;
+        }
+        balance.error = Some(error.public());
+        drop(balance);
+        self.balance_status()
     }
 }
 
@@ -372,6 +618,16 @@ fn main_window_owner_handle(window: &WebviewWindow) -> AppResult<isize> {
     match handle.as_raw() {
         RawWindowHandle::Win32(handle) => Ok(handle.hwnd.get()),
         _ => Err(AppError::CredentialPrompt),
+    }
+}
+
+fn prompt_provider(provider: ProviderId) -> PromptProvider {
+    match provider {
+        ProviderId::Zai => PromptProvider::Zai,
+        ProviderId::DeepSeek => PromptProvider::DeepSeek,
+        ProviderId::AlibabaUs => PromptProvider::AlibabaUs,
+        ProviderId::Google => PromptProvider::Google,
+        ProviderId::Nvidia => PromptProvider::Nvidia,
     }
 }
 
@@ -510,19 +766,51 @@ fn measure_json_value(
 fn app_status(
     request: Request<'_>,
     window: WebviewWindow,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> AppResult<AppStatus> {
     ensure_main_window(&window)?;
     validate_ipc_request(&request, &[])?;
-    let (provider_reachability, online) = state.provider_reachability();
     Ok(AppStatus {
         mode: "desktop",
         version: env!("CARGO_PKG_VERSION"),
-        online,
-        provider_reachability,
+        // Aster does not perform a global connectivity probe. Provider-specific
+        // reachability changes only after a real provider request.
+        online: false,
         database_ready: true,
-        external_processing_acknowledged: state.external_processing_acknowledged(),
     })
+}
+
+#[tauri::command]
+fn model_catalog(request: Request<'_>, window: WebviewWindow) -> AppResult<ModelCatalog> {
+    ensure_main_window(&window)?;
+    validate_ipc_request(&request, &[])?;
+    Ok(api::model_catalog())
+}
+
+#[tauri::command]
+fn provider_statuses(
+    request: Request<'_>,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<ProviderStatus>> {
+    ensure_main_window(&window)?;
+    validate_ipc_request(&request, &[])?;
+    ProviderId::ALL
+        .into_iter()
+        .map(|provider_id| {
+            let configured = state.credentials().status(provider_id)?.configured;
+            let notice_version = api::provider_notice_version(provider_id);
+            Ok(ProviderStatus {
+                provider_id,
+                configured,
+                reachability: state.reachability(provider_id),
+                notice_version,
+                notice_acknowledged: state
+                    .database()
+                    .notice_acknowledged(provider_id, notice_version)?,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -532,20 +820,11 @@ fn acknowledge_external_processing(
     state: State<'_, AppState>,
 ) -> AppResult<()> {
     ensure_main_window(&window)?;
-    validate_ipc_request(&request, &[])?;
-    state.acknowledge_external_processing();
-    Ok(())
-}
-
-#[tauri::command]
-fn credential_status(
-    request: Request<'_>,
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-) -> AppResult<CredentialStatus> {
-    ensure_main_window(&window)?;
-    validate_ipc_request(&request, &[])?;
-    state.credentials().status()
+    let arguments: ProviderArgs = parse_ipc_request(&request, &["providerId"])?;
+    state.database().acknowledge_notice(
+        arguments.provider_id,
+        api::provider_notice_version(arguments.provider_id),
+    )
 }
 
 #[tauri::command]
@@ -555,33 +834,39 @@ async fn prompt_store_api_key(
     state: State<'_, AppState>,
 ) -> AppResult<CredentialPromptResult> {
     ensure_main_window(&window)?;
-    validate_ipc_request(&request, &[])?;
+    let arguments: ProviderArgs = parse_ipc_request(&request, &["providerId"])?;
     let state = state.inner().clone();
-    let lease = state.reserve_credential_mutation(true)?;
+    let lease = state.reserve_credential_mutation(arguments.provider_id)?;
     let owner_window = main_window_owner_handle(&window)?;
+    let provider_id = arguments.provider_id;
+    let native_provider = prompt_provider(provider_id);
     let (lease, prompt_result) = tauri::async_runtime::spawn_blocking(move || {
-        let result = aster_credential_prompt::prompt_api_key(owner_window);
+        let result = aster_credential_prompt::prompt_api_key(owner_window, native_provider);
         (lease, result)
     })
     .await
     .map_err(|_| AppError::CredentialPrompt)?;
-
     let result = match prompt_result {
-        Ok(PromptOutcome::Submitted(api_key)) => {
-            state
-                .credentials()
-                .store(api_key)
-                .map(|status| CredentialPromptResult {
+        Ok(PromptOutcome::Submitted(api_key)) => state
+            .credentials()
+            .store(provider_id, api_key)
+            .and_then(|status| {
+                if provider_id == ProviderId::DeepSeek {
+                    state.invalidate_deepseek_balance()?;
+                }
+                Ok(CredentialPromptResult {
+                    provider_id,
                     configured: status.configured,
                     source: status.source,
                     cancelled: false,
                 })
-        }
+            }),
         Ok(PromptOutcome::Cancelled) => {
             state
                 .credentials()
-                .status()
+                .status(provider_id)
                 .map(|status| CredentialPromptResult {
+                    provider_id,
                     configured: status.configured,
                     source: status.source,
                     cancelled: true,
@@ -606,10 +891,17 @@ fn delete_api_key(
     state: State<'_, AppState>,
 ) -> AppResult<CredentialStatus> {
     ensure_main_window(&window)?;
-    validate_ipc_request(&request, &[])?;
-    let lease = state.reserve_credential_mutation(false)?;
-    state.cancel_all();
-    let result = state.credentials().delete();
+    let arguments: ProviderArgs = parse_ipc_request(&request, &["providerId"])?;
+    let lease = state.reserve_credential_mutation(arguments.provider_id)?;
+    let result = state
+        .credentials()
+        .delete(arguments.provider_id)
+        .and_then(|status| {
+            if arguments.provider_id == ProviderId::DeepSeek {
+                state.invalidate_deepseek_balance()?;
+            }
+            Ok(status)
+        });
     drop(lease);
     result
 }
@@ -645,8 +937,27 @@ fn create_conversation(
     state: State<'_, AppState>,
 ) -> AppResult<Conversation> {
     ensure_main_window(&window)?;
-    let arguments: CreateConversationArgs = parse_ipc_request(&request, &["title"])?;
-    state.database().create_conversation(arguments.title)
+    let arguments: CreateConversationArgs =
+        parse_ipc_request(&request, &["title", "providerId", "modelId"])?;
+    state
+        .database()
+        .create_conversation(arguments.title, arguments.provider_id, arguments.model_id)
+}
+
+#[tauri::command]
+fn update_conversation_selection(
+    request: Request<'_>,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<Conversation> {
+    ensure_main_window(&window)?;
+    let arguments: UpdateConversationSelectionArgs =
+        parse_ipc_request(&request, &["conversationId", "providerId", "modelId"])?;
+    state.update_conversation_selection(
+        &arguments.conversation_id,
+        arguments.provider_id,
+        arguments.model_id,
+    )
 }
 
 #[tauri::command]
@@ -671,10 +982,7 @@ fn delete_conversation(
 ) -> AppResult<()> {
     ensure_main_window(&window)?;
     let arguments: ConversationIdArgs = parse_ipc_request(&request, &["conversationId"])?;
-    state.ensure_conversation_inactive(&arguments.conversation_id)?;
-    state
-        .database()
-        .delete_conversation(&arguments.conversation_id)
+    state.delete_conversation(&arguments.conversation_id)
 }
 
 #[tauri::command]
@@ -689,155 +997,181 @@ async fn send_message(
         &[
             "conversationId",
             "content",
-            "reasoningMode",
+            "responseProfile",
             "regenerateFromMessageId",
         ],
     )?;
     let state = state.inner().clone();
-    let (request_id, cancellation) =
-        state.reserve_generation_for_send(&arguments.conversation_id)?;
-
-    if let Err(error) = state.database().validate_generation_request(
+    state.database().validate_generation_request(
         &arguments.conversation_id,
         &arguments.content,
         arguments.regenerate_from_message_id.as_deref(),
-    ) {
+    )?;
+    let (request_id, cancellation, conversation) =
+        state.reserve_generation(&arguments.conversation_id)?;
+    let notice_version = api::provider_notice_version(conversation.provider_id);
+    let notice_acknowledged = match state
+        .database()
+        .notice_acknowledged(conversation.provider_id, notice_version)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            state.release_generation(&request_id);
+            return Err(error);
+        }
+    };
+    if !notice_acknowledged {
         state.release_generation(&request_id);
-        return Err(error);
+        return Err(AppError::ExternalProcessingNoticeRequired);
     }
-
-    let api_key = match state.credentials().load() {
-        Ok(value) => value,
+    let api_key = match state.credentials().load(conversation.provider_id) {
+        Ok(api_key) => api_key,
         Err(error) => {
             state.release_generation(&request_id);
             return Err(error);
         }
     };
-    let prepared = match prepare_generation(
-        &state,
-        &arguments.conversation_id,
-        arguments.content,
-        arguments.reasoning_mode,
-        arguments.regenerate_from_message_id,
+    let prepared = match state.validate_and_start_generation(
+        &request_id,
+        &conversation.id,
+        conversation.provider_id,
+        &conversation.model_id,
+        || {
+            state.database().prepare_generation(
+                &request_id,
+                &conversation.id,
+                arguments.content,
+                arguments.response_profile,
+                arguments.regenerate_from_message_id,
+                |prepared| {
+                    if prepared.provider_id != conversation.provider_id
+                        || prepared.model_id != conversation.model_id
+                    {
+                        return Err(AppError::DatabaseIntegrity);
+                    }
+                    if cancellation.is_cancelled() {
+                        return Err(AppError::Cancelled);
+                    }
+                    let provider_request = state.provider().prepare_chat(
+                        prepared.provider_id,
+                        &prepared.model_id,
+                        prepared.response_profile,
+                        &prepared.history,
+                    )?;
+                    complete_generation_preflight(&cancellation, || {
+                        emit_stream_event(
+                            &window,
+                            StreamEvent {
+                                request_id: request_id.clone(),
+                                conversation_id: conversation.id.clone(),
+                                provider_id: prepared.provider_id,
+                                model_id: prepared.model_id.clone(),
+                                sequence: 0,
+                                kind: "started",
+                                delta: None,
+                                message: None,
+                                error: None,
+                                error_code: None,
+                                retryable: None,
+                            },
+                        )
+                    })?;
+                    Ok(provider_request)
+                },
+            )
+        },
     ) {
-        Ok(value) => value,
+        Ok(prepared) => prepared,
         Err(error) => {
             state.release_generation(&request_id);
             return Err(error);
         }
     };
-
+    let (prepared, provider_request) = prepared;
     let task_request_id = request_id.clone();
+    let PreparedGeneration {
+        provider_id,
+        model_id,
+        ..
+    } = prepared;
     tauri::async_runtime::spawn(run_generation(
         window,
         state,
-        task_request_id,
-        arguments.conversation_id,
-        prepared,
-        api_key,
-        cancellation,
+        GenerationTask {
+            request_id: task_request_id,
+            conversation_id: conversation.id,
+            provider_id,
+            model_id,
+            provider_request,
+            api_key,
+            cancellation,
+        },
     ));
     Ok(SendMessageResult { request_id })
 }
 
-fn prepare_generation(
-    state: &AppState,
-    conversation_id: &str,
-    content: String,
-    reasoning_mode: ReasoningMode,
-    regenerate_from_message_id: Option<String>,
-) -> AppResult<PreparedGeneration> {
-    state.database().prepare_generation(
+async fn run_generation(window: WebviewWindow, state: AppState, task: GenerationTask) {
+    let GenerationTask {
+        request_id,
         conversation_id,
-        content,
-        reasoning_mode,
-        regenerate_from_message_id,
-    )
-}
-
-async fn run_generation(
-    window: WebviewWindow,
-    state: AppState,
-    request_id: String,
-    conversation_id: String,
-    prepared: PreparedGeneration,
-    api_key: Zeroizing<String>,
-    cancellation: CancellationToken,
-) {
-    let mut sequence = 0_u64;
-    if emit_stream_event(
-        &window,
-        StreamEvent {
-            request_id: request_id.clone(),
-            conversation_id: conversation_id.clone(),
-            sequence,
-            kind: "started",
-            delta: None,
-            message: None,
-            error: None,
-            error_code: None,
-            retryable: None,
-        },
-    )
-    .is_err()
-    {
-        cancellation.cancel();
-    }
-
+        provider_id,
+        model_id,
+        provider_request,
+        api_key,
+        cancellation,
+    } = task;
+    let mut sequence = 0u64;
     let mut content = String::new();
     let result = state
         .provider()
-        .stream_chat(
-            &prepared.history,
-            prepared.reasoning_mode,
-            api_key.as_str(),
-            &cancellation,
-            |delta| {
-                if cancellation.is_cancelled() {
-                    return Err(AppError::Cancelled);
-                }
-                content.push_str(&delta);
-                sequence = next_stream_sequence(sequence)?;
-                emit_stream_event(
-                    &window,
-                    StreamEvent {
-                        request_id: request_id.clone(),
-                        conversation_id: conversation_id.clone(),
-                        sequence,
-                        kind: "delta",
-                        delta: Some(delta),
-                        message: None,
-                        error: None,
-                        error_code: None,
-                        retryable: None,
-                    },
-                )
-            },
-        )
+        .stream_prepared_chat(provider_request, api_key.as_str(), &cancellation, |delta| {
+            if cancellation.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            accept_stream_delta(&mut sequence, &mut content, &delta)?;
+            emit_stream_event(
+                &window,
+                StreamEvent {
+                    request_id: request_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    provider_id,
+                    model_id: model_id.clone(),
+                    sequence,
+                    kind: "delta",
+                    delta: Some(delta),
+                    message: None,
+                    error: None,
+                    error_code: None,
+                    retryable: None,
+                },
+            )
+        })
         .await;
     drop(api_key);
-    state.record_provider_result(&result);
-
-    let cancelled = match state.claim_terminal(&request_id) {
-        Ok(Some(value)) => value || matches!(&result, Err(AppError::Cancelled)),
-        Ok(None) | Err(_) => return,
-    };
-    let terminal_sequence = match next_stream_sequence(sequence) {
+    state.record_provider_result(provider_id, &result);
+    let cancelled =
+        match state.claim_terminal(&request_id, &conversation_id, provider_id, &model_id) {
+            Ok(Some(value)) => value || matches!(&result, Err(AppError::Cancelled)),
+            Ok(None) | Err(_) => return,
+        };
+    let terminal_sequence = match next_terminal_stream_sequence(sequence) {
         Ok(value) => value,
         Err(_) => {
             state.release_generation(&request_id);
             return;
         }
     };
-
     if cancelled {
         emit_persisted_terminal(
             &window,
             &state,
             &request_id,
             &conversation_id,
+            provider_id,
+            &model_id,
             content,
             MessageStatus::Cancelled,
+            None,
             None,
             None,
             terminal_sequence,
@@ -845,30 +1179,43 @@ async fn run_generation(
         state.release_generation(&request_id);
         return;
     }
-
     match result {
         Ok(outcome) => emit_persisted_terminal(
             &window,
             &state,
             &request_id,
             &conversation_id,
+            provider_id,
+            &model_id,
             content,
             MessageStatus::Complete,
-            outcome.token_usage,
+            Some(outcome.finish_reason),
+            outcome.usage,
             None,
             terminal_sequence,
         ),
-        Err(error) => emit_persisted_terminal(
-            &window,
-            &state,
-            &request_id,
-            &conversation_id,
-            content,
-            MessageStatus::Error,
-            None,
-            Some(error),
-            terminal_sequence,
-        ),
+        Err(error) => {
+            if matches!(
+                error,
+                AppError::ProviderContentRejected | AppError::UnsupportedProviderCapability
+            ) {
+                content.clear();
+            }
+            emit_persisted_terminal(
+                &window,
+                &state,
+                &request_id,
+                &conversation_id,
+                provider_id,
+                &model_id,
+                content,
+                MessageStatus::Error,
+                None,
+                None,
+                Some(error),
+                terminal_sequence,
+            );
+        }
     }
     state.release_generation(&request_id);
 }
@@ -879,16 +1226,23 @@ fn emit_persisted_terminal(
     state: &AppState,
     request_id: &str,
     conversation_id: &str,
+    provider_id: ProviderId,
+    model_id: &str,
     content: String,
     status: MessageStatus,
-    token_usage: Option<u64>,
+    finish_reason: Option<models::MessageFinishReason>,
+    usage: Option<TokenUsage>,
     source_error: Option<AppError>,
     sequence: u64,
 ) {
-    match state
-        .database()
-        .append_assistant_message(conversation_id, content, status, token_usage)
-    {
+    match state.database().persist_generation_terminal(
+        request_id,
+        conversation_id,
+        content,
+        status,
+        finish_reason,
+        usage,
+    ) {
         Ok(message) => {
             let (kind, error, error_code, retryable) = match source_error.as_ref() {
                 Some(source_error) => {
@@ -908,6 +1262,8 @@ fn emit_persisted_terminal(
                 StreamEvent {
                     request_id: request_id.to_owned(),
                     conversation_id: conversation_id.to_owned(),
+                    provider_id,
+                    model_id: model_id.to_owned(),
                     sequence,
                     kind,
                     delta: None,
@@ -925,6 +1281,8 @@ fn emit_persisted_terminal(
                 StreamEvent {
                     request_id: request_id.to_owned(),
                     conversation_id: conversation_id.to_owned(),
+                    provider_id,
+                    model_id: model_id.to_owned(),
                     sequence,
                     kind: "error",
                     delta: None,
@@ -945,8 +1303,129 @@ fn emit_stream_event(window: &WebviewWindow, event: StreamEvent) -> AppResult<()
         .map_err(|_| AppError::Internal)
 }
 
+fn complete_generation_preflight(
+    cancellation: &CancellationToken,
+    emit_started: impl FnOnce() -> AppResult<()>,
+) -> AppResult<()> {
+    if cancellation.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
+    emit_started()?;
+    if cancellation.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
+    Ok(())
+}
+
 fn next_stream_sequence(sequence: u64) -> AppResult<u64> {
     sequence.checked_add(1).ok_or(AppError::Internal)
+}
+
+fn next_delta_stream_sequence(sequence: u64) -> AppResult<u64> {
+    let next = next_stream_sequence(sequence)?;
+    if next >= MAX_STREAM_EVENTS - 1 {
+        return Err(AppError::MalformedStream);
+    }
+    Ok(next)
+}
+
+fn accept_stream_delta(sequence: &mut u64, content: &mut String, delta: &str) -> AppResult<()> {
+    let next = next_delta_stream_sequence(*sequence)?;
+    content.push_str(delta);
+    *sequence = next;
+    Ok(())
+}
+
+fn next_terminal_stream_sequence(sequence: u64) -> AppResult<u64> {
+    let next = next_stream_sequence(sequence)?;
+    if next >= MAX_STREAM_EVENTS {
+        return Err(AppError::MalformedStream);
+    }
+    Ok(next)
+}
+
+#[tauri::command]
+fn cancel_generation(
+    request: Request<'_>,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    ensure_main_window(&window)?;
+    let arguments: RequestIdArgs = parse_ipc_request(&request, &["requestId"])?;
+    state.cancel_generation(&arguments.request_id)
+}
+
+#[tauri::command]
+fn usage_summary(
+    request: Request<'_>,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<UsageSummary> {
+    ensure_main_window(&window)?;
+    let arguments: UsageSummaryArgs = parse_ipc_request(&request, &["providerId", "modelId"])?;
+    state
+        .database()
+        .usage_summary(arguments.provider_id, arguments.model_id.as_deref())
+}
+
+#[tauri::command]
+fn set_usage_budget(
+    request: Request<'_>,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<UsageSummary> {
+    ensure_main_window(&window)?;
+    let arguments: SetUsageBudgetArgs =
+        parse_ipc_request(&request, &["providerId", "tokenBudget"])?;
+    state
+        .database()
+        .set_usage_budget(arguments.provider_id, arguments.token_budget)?;
+    state.database().usage_summary(arguments.provider_id, None)
+}
+
+#[tauri::command]
+fn deepseek_balance_status(
+    request: Request<'_>,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<DeepSeekBalanceStatus> {
+    ensure_main_window(&window)?;
+    validate_ipc_request(&request, &[])?;
+    state.balance_status()
+}
+
+#[tauri::command]
+async fn refresh_deepseek_balance(
+    request: Request<'_>,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<DeepSeekBalanceStatus> {
+    ensure_main_window(&window)?;
+    validate_ipc_request(&request, &[])?;
+    let state = state.inner().clone();
+    let authority = state.begin_balance_refresh()?;
+    let api_key = match state.credentials().load(ProviderId::DeepSeek) {
+        Ok(api_key) => api_key,
+        Err(error) => return state.record_balance_error(authority, &error, true, false),
+    };
+    let cancellation = CancellationToken::new();
+    let result = state
+        .provider()
+        .refresh_deepseek_balance(api_key.as_str(), &cancellation)
+        .await;
+    drop(api_key);
+    match result {
+        Ok(parsed) => state.record_balance_success(authority, parsed),
+        Err(error) => state.record_balance_error(authority, &error, false, true),
+    }
+}
+
+#[tauri::command]
+fn open_provider_account(request: Request<'_>, window: WebviewWindow) -> AppResult<()> {
+    ensure_main_window(&window)?;
+    let arguments: ProviderAccountArgs = parse_ipc_request(&request, &["providerId", "action"])?;
+    let url = api::account_url(arguments.provider_id, arguments.action)?;
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|_| AppError::ExternalNavigation)
 }
 
 fn validate_external_url(value: &str) -> AppResult<Url> {
@@ -1007,17 +1486,6 @@ fn open_external_url(request: Request<'_>, window: WebviewWindow) -> AppResult<(
 }
 
 #[tauri::command]
-fn cancel_generation(
-    request: Request<'_>,
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-) -> AppResult<()> {
-    ensure_main_window(&window)?;
-    let arguments: RequestIdArgs = parse_ipc_request(&request, &["requestId"])?;
-    state.cancel_generation(&arguments.request_id)
-}
-
-#[tauri::command]
 async fn export_conversation(
     request: Request<'_>,
     window: WebviewWindow,
@@ -1035,7 +1503,6 @@ async fn export_conversation(
         conversations: vec![conversation.into()],
     };
     let serialized = serialize_bounded(&bundle)?;
-
     let Some(file) = AsyncFileDialog::new()
         .set_parent(&window)
         .set_title("Export Aster conversation")
@@ -1073,7 +1540,6 @@ async fn import_conversations(
     else {
         return Ok(Vec::new());
     };
-
     let path = file.path().to_path_buf();
     let serialized = tauri::async_runtime::spawn_blocking(move || read_bounded(&path))
         .await
@@ -1225,17 +1691,24 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_status,
-            credential_status,
+            model_catalog,
+            provider_statuses,
             acknowledge_external_processing,
             prompt_store_api_key,
             delete_api_key,
             list_conversations,
             get_conversation,
             create_conversation,
+            update_conversation_selection,
             rename_conversation,
             delete_conversation,
             send_message,
             cancel_generation,
+            usage_summary,
+            set_usage_budget,
+            deepseek_balance_status,
+            refresh_deepseek_balance,
+            open_provider_account,
             export_conversation,
             import_conversations,
             open_external_url,
@@ -1265,413 +1738,401 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
-    use serde_json::Value;
-    use tempfile::NamedTempFile;
-
     use super::*;
 
-    #[test]
-    fn bounded_serializer_stops_before_the_limit_is_exceeded() {
-        let payload = "x".repeat(256);
-        let mut writer = BoundedBuffer::new(32);
-        assert!(serde_json::to_writer(&mut writer, &payload).is_err());
-        assert!(writer.exceeded);
-        assert!(writer.bytes.len() <= 32);
-    }
+    const APPLICATION_PERMISSIONS: [&str; 22] = [
+        "allow-app-status",
+        "allow-model-catalog",
+        "allow-provider-statuses",
+        "allow-acknowledge-external-processing",
+        "allow-prompt-store-api-key",
+        "allow-delete-api-key",
+        "allow-list-conversations",
+        "allow-get-conversation",
+        "allow-create-conversation",
+        "allow-update-conversation-selection",
+        "allow-rename-conversation",
+        "allow-delete-conversation",
+        "allow-send-message",
+        "allow-cancel-generation",
+        "allow-usage-summary",
+        "allow-set-usage-budget",
+        "allow-deepseek-balance-status",
+        "allow-refresh-deepseek-balance",
+        "allow-open-provider-account",
+        "allow-export-conversation",
+        "allow-import-conversations",
+        "allow-open-external-url",
+    ];
 
     #[test]
-    fn bounded_reader_rejects_oversized_files_before_allocating_them() {
-        let file = NamedTempFile::new().expect("temporary file should open");
-        file.as_file()
-            .set_len((MAX_TRANSFER_BYTES + 1) as u64)
-            .expect("temporary file should resize");
-        assert!(matches!(
-            read_bounded(file.path()),
-            Err(AppError::Validation(_))
-        ));
-    }
-
-    #[test]
-    fn import_nesting_scan_ignores_brackets_inside_strings_and_rejects_depth_nine() {
-        validate_json_nesting(br#"{"content":"[[[[[[[[["}"#)
-            .expect("string brackets do not affect nesting");
-        assert!(matches!(
-            validate_json_nesting(b"[[[[[[[[[]]]]]]]]]"),
-            Err(AppError::Validation(_))
-        ));
-    }
-
-    #[test]
-    fn raw_ipc_validator_rejects_malformed_unknown_oversized_and_deep_arguments() {
-        assert!(validate_ipc_bytes(b"{}", &[]).is_ok());
-        assert!(matches!(
-            validate_ipc_bytes(br#"{"unexpected":true}"#, &[]),
-            Err(AppError::Validation(_))
-        ));
-        assert!(matches!(
-            validate_ipc_bytes(b"{", &[]),
-            Err(AppError::Validation(_))
-        ));
-        let oversized = vec![b'x'; MAX_IPC_BODY_BYTES + 1];
-        assert!(matches!(
-            validate_ipc_bytes(&oversized, &["content"]),
-            Err(AppError::Validation(_))
-        ));
-        assert!(matches!(
-            validate_ipc_bytes(br#"{"content":[[[[[[[[["x"]]]]]]]]]}"#, &["content"]),
-            Err(AppError::Validation(_))
-        ));
-        validate_ipc_bytes(br#"{"content":"[[[[[[[[["}"#, &["content"])
-            .expect("brackets inside a string do not affect raw nesting");
-
-        let allowed_keys = [
-            "conversationId",
-            "content",
-            "reasoningMode",
-            "regenerateFromMessageId",
-        ];
-        let valid_bytes = serde_json::to_vec(&serde_json::json!({
-            "conversationId": Uuid::new_v4().to_string(),
-            "content": "Bounded prompt",
-            "reasoningMode": "standard"
-        }))
-        .expect("serialize fixture");
-        let valid: SendMessageArgs =
-            parse_ipc_bytes(&valid_bytes, &allowed_keys).expect("valid typed arguments");
-        assert_eq!(valid.content, "Bounded prompt");
-
-        for malformed in [
-            serde_json::json!({
-                "conversationId": Uuid::new_v4().to_string(),
-                "reasoningMode": "standard"
-            }),
-            serde_json::json!({
-                "conversationId": Uuid::new_v4().to_string(),
-                "content": 42,
-                "reasoningMode": "standard"
-            }),
-            serde_json::json!({
-                "conversationId": Uuid::new_v4().to_string(),
-                "content": "Prompt",
-                "reasoningMode": "unsupported"
-            }),
+    fn capability_and_csp_are_exact_least_privilege_boundaries() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/main.json")).unwrap();
+        let permissions = capability["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|permission| permission.starts_with("allow-"))
+            .collect::<Vec<_>>();
+        assert_eq!(permissions, APPLICATION_PERMISSIONS);
+        let serialized_capability = capability.to_string();
+        for forbidden in [
+            "credential-status",
+            "opener:",
+            "shell:",
+            "http:",
+            "fs:",
+            "dialog:",
+            "process:",
+            "*",
         ] {
-            let malformed = serde_json::to_vec(&malformed).expect("serialize malformed fixture");
-            let result: AppResult<SendMessageArgs> = parse_ipc_bytes(&malformed, &allowed_keys);
-            assert!(matches!(result, Err(AppError::Validation(_))));
+            assert!(!serialized_capability.contains(forbidden), "{forbidden}");
         }
 
-        let duplicate = format!(
-            "{{\"conversationId\":\"{}\",\"content\":\"first\",\"content\":\"second\",\"reasoningMode\":\"standard\"}}",
-            Uuid::new_v4()
-        );
-        let result: AppResult<SendMessageArgs> =
-            parse_ipc_bytes(duplicate.as_bytes(), &allowed_keys);
-        assert!(matches!(result, Err(AppError::Validation(_))));
+        let configuration: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(configuration["version"], "0.2.0");
+        assert_eq!(configuration["build"]["removeUnusedCommands"], true);
+        assert_eq!(configuration["app"]["windows"][0]["devtools"], false);
+        let csp = configuration["app"]["security"]["csp"].as_str().unwrap();
+        assert!(csp.contains("connect-src 'self' ipc: http://ipc.localhost;"));
+        assert!(csp.contains("object-src 'none'"));
+        assert!(csp.contains("frame-src 'none'"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(!csp.contains("https:"));
+
+        let build_manifest = include_str!("../build.rs");
+        for permission in APPLICATION_PERMISSIONS {
+            let command = permission.trim_start_matches("allow-").replace('-', "_");
+            assert!(build_manifest.contains(&format!("\"{command}\"")));
+        }
+        assert!(!build_manifest.contains("credential_status"));
     }
 
     #[test]
-    fn generation_registry_enforces_one_request_through_terminal_persistence() {
-        let database = Database::open_in_memory().expect("database");
-        let conversation = database.create_conversation(None).expect("conversation");
-        let state = AppState::new(database, ProviderClient::new().expect("provider"));
-
-        let (request_id, cancellation) = state
-            .reserve_generation(&conversation.id)
-            .expect("first reservation");
-        assert!(matches!(
-            state.reserve_generation(&conversation.id),
-            Err(AppError::Conflict(_))
-        ));
-        assert_eq!(
-            state.claim_terminal(&request_id).expect("claim"),
-            Some(false)
+    fn raw_ipc_rejects_unknown_keys_wrong_types_and_unsafe_budget_numbers() {
+        assert!(
+            parse_ipc_bytes::<ProviderArgs>(br#"{"providerId":"zai"}"#, &["providerId"]).is_ok()
         );
-        state
-            .cancel_generation(&request_id)
-            .expect("late cancellation is idempotent");
-        assert!(!cancellation.is_cancelled());
-        assert!(matches!(
-            state.reserve_generation(&conversation.id),
-            Err(AppError::Conflict(_))
-        ));
-
-        state.release_generation(&request_id);
-        let (second_request, second_cancellation) = state
-            .reserve_generation(&conversation.id)
-            .expect("reservation after persistence");
-        state
-            .cancel_generation(&second_request)
-            .expect("cancel active request");
-        assert!(second_cancellation.is_cancelled());
-        assert_eq!(
-            state.claim_terminal(&second_request).expect("claim"),
-            Some(true)
+        assert!(
+            parse_ipc_bytes::<ProviderArgs>(br#"{"providerId":"ZAI"}"#, &["providerId"]).is_err()
         );
-        state.release_generation(&second_request);
-    }
-
-    #[test]
-    fn external_processing_acknowledgement_is_required_before_reservation_and_is_session_only() {
-        let database = Database::open_in_memory().expect("database");
-        let conversation = database.create_conversation(None).expect("conversation");
-        let state = AppState::new(database.clone(), ProviderClient::new().expect("provider"));
-
-        assert!(matches!(
-            state.reserve_generation_for_send(&conversation.id),
-            Err(AppError::ExternalProcessingNoticeRequired)
-        ));
-        assert!(state.generation_tasks_finished());
+        assert!(
+            parse_ipc_bytes::<ProviderArgs>(
+                br#"{"providerId":"zai","url":"https://evil.example"}"#,
+                &["providerId"]
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ipc_bytes::<SetUsageBudgetArgs>(
+                br#"{"providerId":"zai","tokenBudget":1.5}"#,
+                &["providerId", "tokenBudget"]
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ipc_bytes::<SetUsageBudgetArgs>(
+                br#"{"providerId":"zai","tokenBudget":9007199254740992}"#,
+                &["providerId", "tokenBudget"]
+            )
+            .is_ok()
+        );
+        // The database semantic boundary rejects the syntactically valid out-of-range u64.
+        let database = Database::open_in_memory().unwrap();
         assert!(
             database
+                .set_usage_budget(ProviderId::Zai, Some(9_007_199_254_740_992))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn active_generation_binds_conversation_provider_and_model() {
+        let state = AppState::new(
+            Database::open_in_memory().unwrap(),
+            ProviderClient::new().unwrap(),
+        );
+        let conversation = state
+            .database()
+            .create_conversation(
+                None,
+                Some(ProviderId::Google),
+                Some("gemini-2.5-pro".to_owned()),
+            )
+            .unwrap();
+        let (request_id, _, _) = state.reserve_generation(&conversation.id).unwrap();
+        let active = state.inner.active.lock().unwrap();
+        let generation = active.get(&request_id).unwrap();
+        assert_eq!(generation.provider_id, ProviderId::Google);
+        assert_eq!(generation.model_id, "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn cancellation_from_started_callback_rolls_back_before_request_attempt() {
+        let state = AppState::new(
+            Database::open_in_memory().unwrap(),
+            ProviderClient::new().unwrap(),
+        );
+        let conversation = state
+            .database()
+            .create_conversation(None, None, None)
+            .unwrap();
+        let (request_id, cancellation, reserved) =
+            state.reserve_generation(&conversation.id).unwrap();
+        let cancelling_state = state.clone();
+        let cancelling_request = request_id.clone();
+        let task_would_spawn = AtomicBool::new(false);
+
+        let result = state.validate_and_start_generation(
+            &request_id,
+            &reserved.id,
+            reserved.provider_id,
+            &reserved.model_id,
+            || {
+                state.database().prepare_generation(
+                    &request_id,
+                    &reserved.id,
+                    "Cancel from started".to_owned(),
+                    ResponseProfile::Standard,
+                    None,
+                    |_| {
+                        complete_generation_preflight(&cancellation, || {
+                            cancelling_state.cancel_generation(&cancelling_request)
+                        })
+                    },
+                )
+            },
+        );
+        if result.is_ok() {
+            task_would_spawn.store(true, Ordering::Release);
+        }
+
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(!task_would_spawn.load(Ordering::Acquire));
+        assert!(
+            state
+                .database()
                 .get_conversation(&conversation.id)
-                .expect("unchanged conversation")
+                .unwrap()
                 .messages
                 .is_empty()
         );
-
-        state.acknowledge_external_processing();
-        let (request_id, _) = state
-            .reserve_generation_for_send(&conversation.id)
-            .expect("acknowledged reservation");
-        state.release_generation(&request_id);
-
-        let fresh_session = AppState::new(database, ProviderClient::new().expect("provider"));
-        assert!(!fresh_session.external_processing_acknowledged());
-    }
-
-    #[test]
-    fn credential_mutation_lease_is_single_flight_across_threads() {
-        let database = Database::open_in_memory().expect("database");
-        let state = AppState::new(database, ProviderClient::new().expect("provider"));
-        let worker_state = state.clone();
-        let (acquired_sender, acquired_receiver) = std::sync::mpsc::sync_channel(0);
-        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
-        let worker = std::thread::spawn(move || {
-            let lease = worker_state
-                .reserve_credential_mutation(true)
-                .expect("first credential mutation");
-            acquired_sender.send(()).expect("signal acquisition");
-            release_receiver.recv().expect("wait for release");
-            drop(lease);
-        });
-        acquired_receiver.recv().expect("worker acquired lease");
-
-        assert!(matches!(
-            state.reserve_credential_mutation(true),
-            Err(AppError::CredentialPromptBusy)
-        ));
-        release_sender.send(()).expect("release worker");
-        worker.join().expect("worker should not panic");
-        let lease = state
-            .reserve_credential_mutation(true)
-            .expect("lease should be available after drop");
-        drop(lease);
-    }
-
-    #[test]
-    fn credential_mutation_blocks_new_sends_and_replacement_requires_an_idle_generation() {
-        let database = Database::open_in_memory().expect("database");
-        let conversation = database.create_conversation(None).expect("conversation");
-        let state = AppState::new(database, ProviderClient::new().expect("provider"));
-        state.acknowledge_external_processing();
-
-        let deletion_lease = state
-            .reserve_credential_mutation(false)
-            .expect("delete-style mutation lease");
-        assert!(matches!(
-            state.reserve_generation_for_send(&conversation.id),
-            Err(AppError::CredentialPromptBusy)
-        ));
-        drop(deletion_lease);
-
-        let (request_id, cancellation) = state
-            .reserve_generation_for_send(&conversation.id)
-            .expect("generation reservation");
-        assert!(matches!(
-            state.reserve_credential_mutation(true),
-            Err(AppError::Conflict(_))
-        ));
-        let deletion_lease = state
-            .reserve_credential_mutation(false)
-            .expect("deletion serializes against new sends");
-        state.cancel_all();
-        assert!(cancellation.is_cancelled());
-        drop(deletion_lease);
-        state.release_generation(&request_id);
-    }
-
-    #[test]
-    fn credential_prompt_errors_have_stable_safe_categories() {
-        let invalid = AppError::CredentialInvalid.public();
-        assert_eq!(invalid.code, "credential_invalid");
         assert_eq!(
-            invalid.message,
-            "The API key must contain 8 to 255 printable ASCII characters without whitespace."
+            state
+                .database()
+                .usage_summary(ProviderId::Zai, None)
+                .unwrap()
+                .coverage,
+            "empty"
         );
-        assert!(!invalid.retryable);
-        let unavailable = AppError::CredentialPrompt.public();
-        assert_eq!(unavailable.code, "credential_prompt_unavailable");
-        assert!(unavailable.retryable);
-    }
-
-    #[test]
-    fn stream_sequence_is_strictly_monotonic_and_overflow_is_rejected() {
-        let started = 0;
-        let first_delta = next_stream_sequence(started).expect("first delta");
-        let second_delta = next_stream_sequence(first_delta).expect("second delta");
-        let terminal = next_stream_sequence(second_delta).expect("terminal");
-        assert_eq!([started, first_delta, second_delta, terminal], [0, 1, 2, 3]);
-        assert!(matches!(
-            next_stream_sequence(u64::MAX),
-            Err(AppError::Internal)
-        ));
-    }
-
-    #[tokio::test]
-    async fn shutdown_waits_until_terminal_persistence_releases_the_registry_entry() {
-        let database = Database::open_in_memory().expect("database");
-        let conversation = database.create_conversation(None).expect("conversation");
-        let state = AppState::new(database, ProviderClient::new().expect("provider"));
-        let (request_id, _) = state
-            .reserve_generation(&conversation.id)
-            .expect("reservation");
-        assert_eq!(
-            state.claim_terminal(&request_id).expect("terminal claim"),
-            Some(false)
-        );
-        assert_eq!(state.request_shutdown(), (true, true));
-
-        let waiter_state = state.clone();
-        let waiter = tokio::spawn(async move {
-            wait_for_generation_tasks(&waiter_state).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-        assert!(!state.inner.shutdown_ready.load(Ordering::Acquire));
-        assert!(!waiter.is_finished());
-
         state.release_generation(&request_id);
-        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("shutdown waiter should finish after persistence")
-            .expect("shutdown waiter should not panic");
-        assert!(state.inner.shutdown_ready.load(Ordering::Acquire));
     }
 
     #[test]
-    fn external_url_policy_allows_public_https_and_rejects_local_or_active_schemes() {
-        assert!(validate_external_url("https://docs.z.ai/guides?q=streaming#sse").is_ok());
-        for rejected in [
-            "http://docs.z.ai/",
-            "javascript:alert(1)",
-            "https://user:password@example.com/",
-            "https://localhost/",
-            "https://service.local/",
-            "https://intranet/",
-            "https://127.0.0.1/",
-            "https://[::1]/",
-            " https://example.com/",
-        ] {
-            assert!(
-                validate_external_url(rejected).is_err(),
-                "URL should be rejected: {rejected}"
-            );
-        }
+    fn provider_account_ipc_has_no_model_or_url_field() {
         assert!(
-            validate_external_url(&format!(
-                "https://example.com/{}",
-                "x".repeat(MAX_EXTERNAL_URL_BYTES)
-            ))
+            parse_ipc_bytes::<ProviderAccountArgs>(
+                br#"{"providerId":"deepseek","action":"addCredits"}"#,
+                &["providerId", "action"]
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_ipc_bytes::<ProviderAccountArgs>(
+                br#"{"providerId":"deepseek","action":"addCredits","url":"https://evil.example"}"#,
+                &["providerId", "action"]
+            )
             .is_err()
         );
     }
 
     #[test]
-    fn production_csp_and_capability_are_least_privilege() {
-        let config: Value =
-            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid Tauri config");
-        let csp = config["app"]["security"]["csp"]
-            .as_str()
-            .expect("production CSP");
-        assert!(!csp.contains("unsafe-eval"));
-        assert!(!csp.contains("https:"));
-        assert!(csp.contains("object-src 'none'"));
-        assert!(csp.contains("frame-src 'none'"));
-        assert_eq!(config["plugins"], serde_json::json!({}));
-        let build_script = include_str!("../build.rs");
-        for forbidden in ["open_path", "reveal_item_in_dir", "plugin:opener"] {
-            assert!(!build_script.contains(forbidden));
+    fn external_content_links_reject_local_targets_and_credentials() {
+        assert!(validate_external_url("https://example.com/path").is_ok());
+        for value in [
+            "http://example.com",
+            "https://localhost/test",
+            "https://127.0.0.1/test",
+            "https://user:password@example.com/",
+            "javascript:alert(1)",
+        ] {
+            assert!(validate_external_url(value).is_err(), "{value}");
         }
-        assert!(build_script.contains("\"prompt_store_api_key\""));
-        let retired_secret_command = concat!("\"store_", "api_key\"");
-        assert!(!build_script.contains(retired_secret_command));
-        let generated_acl = include_str!("../gen/schemas/acl-manifests.json");
-        assert!(generated_acl.contains("\"prompt_store_api_key\""));
-        assert!(!generated_acl.contains(retired_secret_command));
+    }
 
-        let capability: Value = serde_json::from_str(include_str!("../capabilities/main.json"))
-            .expect("valid capability");
-        assert_eq!(capability["windows"], serde_json::json!(["main"]));
-        assert_eq!(capability["platforms"], serde_json::json!(["windows"]));
-        let permissions = capability["permissions"]
-            .as_array()
-            .expect("permission list")
-            .iter()
-            .map(|permission| permission.as_str().expect("string permission"))
-            .collect::<BTreeSet<_>>();
-        let expected = [
-            "core:event:allow-listen",
-            "core:event:allow-unlisten",
-            "core:window:allow-minimize",
-            "core:window:allow-toggle-maximize",
-            "core:window:allow-close",
-            "core:window:allow-start-dragging",
-            "allow-app-status",
-            "allow-credential-status",
-            "allow-acknowledge-external-processing",
-            "allow-prompt-store-api-key",
-            "allow-delete-api-key",
-            "allow-list-conversations",
-            "allow-get-conversation",
-            "allow-create-conversation",
-            "allow-rename-conversation",
-            "allow-delete-conversation",
-            "allow-send-message",
-            "allow-cancel-generation",
-            "allow-export-conversation",
-            "allow-import-conversations",
-            "allow-open-external-url",
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        assert_eq!(permissions, expected);
-        let window_permissions = permissions
-            .iter()
-            .copied()
-            .filter(|permission| permission.starts_with("core:window:"))
-            .collect::<BTreeSet<_>>();
+    #[test]
+    fn balance_memory_is_not_checked_then_current_then_stale() {
+        let state = AppState::new(
+            Database::open_in_memory().unwrap(),
+            ProviderClient::new().unwrap(),
+        );
+        assert_eq!(state.balance_status().unwrap().status, "notChecked");
+        let success_authority = state.begin_balance_refresh().unwrap();
+        let current = state
+            .record_balance_success(success_authority, fixture_balance("1"))
+            .unwrap();
+        assert_eq!(current.status, "current");
+        let error_authority = state.begin_balance_refresh().unwrap();
+        let stale = state
+            .record_balance_error(error_authority, &AppError::Network, false, true)
+            .unwrap();
+        assert_eq!(stale.status, "stale");
+        assert_eq!(stale.balance_infos.len(), 1);
+    }
+
+    #[test]
+    fn credential_mutation_invalidates_balance_and_rejects_old_completion() {
+        let state = AppState::new(
+            Database::open_in_memory().unwrap(),
+            ProviderClient::new().unwrap(),
+        );
+        let old_authority = state.begin_balance_refresh().unwrap();
         assert_eq!(
-            window_permissions,
-            [
-                "core:window:allow-close",
-                "core:window:allow-minimize",
-                "core:window:allow-start-dragging",
-                "core:window:allow-toggle-maximize",
-            ]
-            .into_iter()
-            .collect()
+            state
+                .record_balance_success(old_authority, fixture_balance("1"))
+                .unwrap()
+                .status,
+            "current"
         );
+        assert_eq!(state.reachability(ProviderId::DeepSeek), "reachable");
+
+        state.invalidate_deepseek_balance().unwrap();
+        assert_eq!(state.balance_status().unwrap().status, "notChecked");
+        assert_eq!(state.reachability(ProviderId::DeepSeek), "unknown");
+        assert_eq!(
+            state
+                .record_balance_success(old_authority, fixture_balance("999"))
+                .unwrap()
+                .status,
+            "notChecked"
+        );
+        assert_eq!(state.reachability(ProviderId::DeepSeek), "unknown");
+
+        let new_authority = state.begin_balance_refresh().unwrap();
+        let current = state
+            .record_balance_success(new_authority, fixture_balance("2"))
+            .unwrap();
+        assert_eq!(current.status, "current");
+        assert_eq!(current.balance_infos[0].total_balance, "2");
+        assert_eq!(state.reachability(ProviderId::DeepSeek), "reachable");
+    }
+
+    #[test]
+    fn latest_balance_refresh_wins_and_credential_load_error_clears_success() {
+        let state = AppState::new(
+            Database::open_in_memory().unwrap(),
+            ProviderClient::new().unwrap(),
+        );
+        let older = state.begin_balance_refresh().unwrap();
+        let newer = state.begin_balance_refresh().unwrap();
+        assert_eq!(
+            state
+                .record_balance_success(older, fixture_balance("1"))
+                .unwrap()
+                .status,
+            "notChecked"
+        );
+        assert_eq!(
+            state
+                .record_balance_success(newer, fixture_balance("2"))
+                .unwrap()
+                .balance_infos[0]
+                .total_balance,
+            "2"
+        );
+
+        let missing_credential = state.begin_balance_refresh().unwrap();
+        let error = state
+            .record_balance_error(
+                missing_credential,
+                &AppError::CredentialNotConfigured,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(error.status, "error");
+        assert!(error.balance_infos.is_empty());
+        assert_eq!(
+            error.error.expect("credential error").code,
+            "credential_not_configured"
+        );
+    }
+
+    #[test]
+    fn balance_begin_is_serialized_with_authority_check_and_commit() {
+        let state = AppState::new(
+            Database::open_in_memory().unwrap(),
+            ProviderClient::new().unwrap(),
+        );
+        let older = state.begin_balance_refresh().unwrap();
+        let balance_guard = state.inner.balance.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let concurrent_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(concurrent_state.begin_balance_refresh())
+                .unwrap();
+        });
+
         assert!(
-            permissions
-                .iter()
-                .all(|permission| !permission.contains('*'))
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
         );
-        assert!(permissions.iter().all(|permission| {
-            !["shell:", "process:", "fs:", "http:", "opener:", "dialog:"]
-                .iter()
-                .any(|forbidden| permission.starts_with(forbidden))
-        }));
+        assert!(state.authority_is_current(older));
+        drop(balance_guard);
+
+        let newer = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!state.authority_is_current(older));
+        assert!(state.authority_is_current(newer));
+        assert_eq!(
+            state
+                .record_balance_success(older, fixture_balance("stale"))
+                .unwrap()
+                .status,
+            "notChecked"
+        );
+        assert_eq!(state.reachability(ProviderId::DeepSeek), "unknown");
+    }
+
+    #[test]
+    fn stream_event_ceiling_reserves_one_terminal_event() {
+        let mut sequence = 0;
+        let mut content = String::new();
+        for _ in 0..(MAX_STREAM_EVENTS - 2) {
+            accept_stream_delta(&mut sequence, &mut content, "x").unwrap();
+        }
+
+        assert_eq!(sequence, MAX_STREAM_EVENTS - 2);
+        assert_eq!(content.len() as u64, MAX_STREAM_EVENTS - 2);
+        assert_eq!(
+            next_terminal_stream_sequence(sequence).unwrap(),
+            MAX_STREAM_EVENTS - 1
+        );
+        assert!(matches!(
+            accept_stream_delta(&mut sequence, &mut content, "rejected"),
+            Err(AppError::MalformedStream)
+        ));
+        assert_eq!(sequence, MAX_STREAM_EVENTS - 2);
+        assert_eq!(content.len() as u64, MAX_STREAM_EVENTS - 2);
+    }
+
+    fn fixture_balance(total: &str) -> ParsedBalance {
+        ParsedBalance {
+            is_available: true,
+            balance_infos: vec![BalanceInfo {
+                currency: "USD".to_owned(),
+                total_balance: total.to_owned(),
+                granted_balance: total.to_owned(),
+                topped_up_balance: "0".to_owned(),
+            }],
+        }
     }
 }

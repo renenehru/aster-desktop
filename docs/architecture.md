@@ -1,251 +1,207 @@
-# Aster Desktop — MVP v1 Architecture
+# Aster Desktop — MVP v2 Architecture
 
 **Status:** Normative architecture baseline
 
-**Target:** Windows 11 desktop
+**Last updated:** 2026-07-13
 
-**Last updated:** 2026-07-12
-
-**Implementation status:** This is the required target architecture. Present-tense diagrams name responsibilities and boundaries; they are not evidence that a revision or package implements them.
+**Implementation status:** This document describes the required design. It does not assert that the implementation or any verification gate passes.
 
 ## 1. Architecture goals
 
-This architecture supports the requirements in [product-spec.md](product-spec.md) while enforcing the controls in [security-requirements.md](security-requirements.md). Its central design rule is that the React webview is untrusted presentation code. All secret-bearing, persistent, networked, or policy-enforcing operations terminate in Rust.
-
-The MVP optimizes for:
-
-- a small and auditable privilege surface;
-- responsive streamed chat with real cancellation;
-- deterministic local persistence and recovery;
-- Windows-native credential storage and file selection;
-- safe treatment of model output and imported data;
-- testable boundaries with replaceable adapters;
-- no dormant permissions for deferred projects, attachments, or tools.
+- A Windows 11 desktop experience with local history and streamed direct-provider chat.
+- A closed, auditable provider/model catalog with no arbitrary endpoint or model path.
+- Secrets and privileged operations outside the React webview.
+- Provider/model identity fixed for the life of a non-empty conversation.
+- Honest response profiles and token observations without invented cross-provider semantics.
+- Provider-scoped native credentials and explicit provider-specific disclosure.
+- Transaction-safe SQLite migration, persistence, import, export, and usage accounting.
+- Narrow default-browser account navigation without in-app billing mutations.
+- Deterministic browser-demo presentation with no desktop capability, key, persistence, or network.
 
 ## 2. System context and trust boundaries
 
 ```mermaid
 flowchart LR
-    User["User on Windows 11"]
-
-    subgraph Device["User device"]
-        subgraph Webview["TB-01: untrusted presentation boundary"]
-            UI["React + TypeScript UI"]
-        end
-
-        subgraph Core["TB-02: trusted application core"]
-            IPC["Typed Tauri command/event boundary"]
-            App["Rust application services"]
-            Provider["Provider adapter + SSE parser"]
-            Repo["Conversation repository"]
-            Importer["Import/export service"]
-        end
-
-        DB[("SQLite conversation database")]
-        Vault["Windows credential store"]
-        Dialog["Native open/save dialog"]
-    end
-
-    subgraph External["TB-03: external provider boundary"]
-        API["Official Z.AI HTTPS API"]
-        GLM["glm-5.1"]
-    end
-
-    User --> UI
-    UI -->|"allowlisted typed commands"| IPC
-    IPC --> App
-    App --> Provider
-    App --> Repo
-    App --> Importer
-    Provider -->|"read key"| Vault
-    Repo --> DB
-    Importer --> Repo
-    Importer --> Dialog
-    Provider -->|"HTTPS + SSE"| API
-    API --> GLM
-    Provider -->|"typed deltas"| IPC
-    IPC --> UI
+    User["Windows user"] --> UI["React presentation"]
+    UI -->|"typed raw-JSON IPC; no secrets or URLs"| Core["Tauri / Rust core"]
+    Core --> Catalog["Compiled provider catalog"]
+    Core --> DB["User-scoped SQLite"]
+    Core --> Prompt["Native Windows credential prompt"]
+    Prompt --> Vault["Provider-scoped Windows credential targets"]
+    Core --> ZAI["Z.AI official HTTPS API"]
+    Core --> DS["DeepSeek official HTTPS API"]
+    Core --> Ali["Alibaba Cloud US official HTTPS API"]
+    Core --> Google["Google Gemini official HTTPS API"]
+    Core --> Nvidia["NVIDIA hosted prototype HTTPS API"]
+    Core --> Dialog["Native import/export dialogs"]
+    Core --> Browser["Default browser: fixed provider account URL"]
 ```
 
-### 2.1 Assets
+| Boundary | From → to                                    | Data                                                              | Primary protections                                                                                        |
+| -------- | -------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `TB-01`  | User/provider/import → React                 | Untrusted Markdown, links, labels, status                         | React element allowlist renderer, no raw HTML execution, accessible app-owned chrome                       |
+| `TB-02`  | React → Rust                                 | Raw UTF-8 JSON commands with IDs/text/enums                       | Main-window restriction, byte-before-parse bound, exact schema and state validation                        |
+| `TB-03`  | Native prompt → Rust → credential store      | One provider API key                                              | Fixed prompt copy, provider allowlist, separate targets, zeroization, no secret IPC                        |
+| `TB-04`  | Rust repository → SQLite                     | Conversations, messages, usage, preferences, migrations           | Parameterized SQL, foreign keys, transactions, bounds, corruption-safe failure                             |
+| `TB-05`  | Rust adapters ↔ official provider APIs       | Sensitive context, authorization, untrusted streams/usage/balance | Compiled exact origins/paths, TLS, per-provider credentials, request fixtures, bounded parsing             |
+| `TB-06`  | Native file dialog ↔ import/export           | Untrusted JSON / plaintext export                                 | Rust-owned dialog, exact versioned schema, bounded read/write, atomic import                               |
+| `TB-07`  | Source/dependencies → build → package        | Code, lockfiles, binaries, signatures                             | Locked dependencies, clean-revision build identity, artifact/SBOM/dist hashes, inventory, signing evidence |
+| `TB-08`  | Rust typed action → operating-system browser | Fixed official provider account URL                               | No renderer URL, fixed provider/action map, external browser only                                          |
 
-| Asset                       | Classification                      | Authoritative owner                                                  | Notes                                                 |
-| --------------------------- | ----------------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------- |
-| Z.AI API key                | Secret                              | Native credential prompt, Rust process, and Windows credential store | Never enters the webview or crosses IPC               |
-| Prompt and response content | Sensitive user content              | SQLite / Rust repository                                             | Sent externally only as required for a user request   |
-| Conversation metadata       | Sensitive metadata                  | SQLite / Rust repository                                             | Includes timestamps and model settings                |
-| Import/export content       | Untrusted and potentially sensitive | Rust import/export service                                           | Versioned, bounded, validated                         |
-| Application configuration   | Internal                            | Rust configuration service                                           | Must not contain credentials                          |
-| Safe application errors     | Internal                            | Ephemeral Rust/IPC values                                            | Stable code, bounded message, and retryable flag only |
-| Packaged application        | Integrity-critical                  | Build/release pipeline                                               | Production artifacts require signature evidence       |
+### 2.1 Data classification
 
-### 2.2 Data classification rules
+| Asset                                   | Classification               | Allowed locations                                                           | Prohibited behavior                                              |
+| --------------------------------------- | ---------------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Provider API key                        | Secret                       | Native prompt, minimum-lived Rust value, matching Windows credential target | React, IPC, SQLite, logs, exports, another provider              |
+| Prompts/responses/history               | Sensitive user content       | React for display, Rust, SQLite, selected provider request, explicit export | Unrelated provider/conversation, telemetry, diagnostics          |
+| DeepSeek balance                        | Sensitive financial metadata | Minimum-lived Rust response and bounded status DTO for current session      | SQLite, export, logs, background polling, other provider         |
+| Token usage observation                 | Internal usage metadata      | Rust and SQLite; bounded normalized counts and UTC time only                | Prompt/response/title/raw payload, billing or price claim        |
+| Weekly provider budget                  | Internal configuration       | Rust and SQLite; provider ID plus bounded token integer                     | Credential storage, provider transmission, request authorization |
+| Provider catalog/action map             | Public application policy    | Rust source/package and safe catalog DTO                                    | Runtime modification by renderer/import/remote model list        |
+| Provider/model output and imported data | Untrusted                    | Validated storage and safe presentation                                     | Command, filesystem, URL, model-selection, or billing authority  |
 
-`Secret` data may only cross the credential-store/provider boundary in Rust. `Sensitive user content` may cross to Z.AI only after the external-processing notice and explicit send action. It may cross to a user-selected export path only after an export action and warning. `Untrusted` is a validation property, not a confidentiality level: imported text and model output remain untrusted even when stored locally.
+Sensitive content crosses `TB-05` only after the UI identifies the selected provider and any fixed regional boundary. Alibaba Cloud is always identified as `Alibaba Cloud (US)` before transmission. Token usage is product state, not a diagnostic log. DeepSeek balance is not local token usage and the UI keeps those concepts separate.
 
 ## 3. Component responsibilities
 
-| Component               | Owns                                                                                            | Must not own                                                                          |
-| ----------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| React application       | Layout, accessible interaction, local view state, safe Markdown presentation, typed IPC client  | Provider credentials, SQL, direct external HTTP, filesystem paths, security decisions |
-| Tauri command layer     | Window allowlist, request deserialization, semantic validation, stable result/error envelope    | Business logic duplication, raw database handles in responses                         |
-| Conversation service    | Chat lifecycle, one-active-request rule, edit/regenerate semantics, transactional state changes | UI rendering or OS credential implementation                                          |
-| Provider adapter        | Request mapping, authorization injection, timeouts, bounded retry, SSE parsing, cancellation    | Persisting credentials, arbitrary origins, UI event decisions                         |
-| Credential adapter      | Store/replace/delete/check existence of key                                                     | Returning the key to the UI, logging key material                                     |
-| Conversation repository | Migrations, parameterized CRUD, transactions, ordering                                          | Network calls, rendering Markdown                                                     |
-| Import/export service   | Versioned schema, size/shape validation, atomic import, safe serialization                      | Interpreting imported markup, arbitrary path construction                             |
+| Component             | Owns                                                                                                   | Must not own                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| React application     | Layout, accessible interaction, view state, safe Markdown, typed IPC client                            | Keys, SQL, provider HTTP, endpoint/model policy, filesystem paths, account URLs |
+| Rust command boundary | Main-window authorization, raw body bounds, exact DTO validation, safe errors                          | Pre-deserialized unbounded input or UI-only authorization                       |
+| Catalog service       | Provider/model IDs, default pair, display/capability metadata, adapter selection                       | Remote/user model discovery, unavailable entries, secrets                       |
+| Conversation service  | Lifecycle, pinned provider/model, request/event identity, edit/regenerate, cancellation                | Provider-specific wire fields or UI rendering                                   |
+| Provider adapters     | Exact URL/auth/request mapping, TLS, timeouts, one-attempt policy, stream parsing, usage normalization | Arbitrary origins, persistence, UI copy, cross-provider fallback                |
+| Credential service    | Native prompt, provider-specific target, read/write/delete, minimum secret lifetime                    | Secret-bearing IPC or generic credential target                                 |
+| Usage service         | Idempotent normalized observations, seven-day aggregates, per-provider budgets, partial coverage       | Prices, invoices, request blocking, raw provider payloads                       |
+| Balance service       | Explicit DeepSeek read-only refresh, response validation, session-memory result                        | Background polling, mutation endpoint, persistence, non-DeepSeek balance calls  |
+| Repository            | Migrations, parameterized SQLite transactions, import/export persistence                               | Credentials, raw provider traces, balance                                       |
+| Native integration    | Credential/file dialogs and fixed provider account opener                                              | Renderer-supplied path/account URL or shell/process capability                  |
 
-Security-sensitive logic **MUST** expose deterministic test seams. An interface **MAY** be a Rust trait where runtime substitution is needed; the MVP may use concrete database, credential-store, provider, and native-dialog adapters when pure validators, temporary SQLite databases, controlled inputs, and parser fixtures provide equivalent isolation. Tests **MUST NOT** touch a real credential store, user database, arbitrary filesystem location, or paid endpoint.
+All security-sensitive services require deterministic seams. Tests use temporary SQLite, fake credential targets, fixed clocks, fake streams, and controlled HTTPS endpoints; they do not touch the user's database, credential store, or a billable endpoint by default.
 
 ## 4. Runtime profiles
 
-### 4.1 Desktop profile
+### 4.1 Desktop
 
-The desktop profile **MUST** register only the production command handlers and concrete adapters required by the MVP:
+Desktop uses SQLite, native Windows dialogs, provider-scoped credential-store entries, exact HTTPS provider adapters, and the system browser. Production configuration contains no development URL, fake endpoint, key, or remote active UI asset.
 
-- SQLite database in the application data directory with user-scoped permissions;
-- Rust-owned native Windows credential prompt and credential-store entry scoped to this application and provider;
-- HTTPS provider client with platform certificate validation and exact-origin policy;
-- native open/save dialogs for import and export;
-- restrictive Tauri capability and Content Security Policy configuration.
+### 4.2 Browser demo
 
-### 4.2 Browser demo profile
-
-The browser profile exists only to inspect UI behavior when Tauri is unavailable. It **MUST** use a deterministic, in-memory chat adapter and non-sensitive sample data. It has no credential method, external networking, SQLite, privileged filesystem, or persistence capability. A user-initiated browser file picker and download may exercise demo import/export presentation, but do not prove the desktop native-dialog or Rust validation path. The UI **MUST** display `Demo mode`; security and desktop acceptance tests cannot use this profile as evidence.
-
-Production builds must not include hidden development endpoints, provider proxies, seeded private conversation data, or a default API key. The loopback Vite URL exists only in `tauri.dev.conf.json`, which the explicit desktop-development script overlays; it is absent from the production Tauri configuration and release context.
+Browser demo uses a deterministic in-memory adapter with a synthetic copy of the public catalog, synthetic response streams, synthetic usage coverage, and synthetic balance/account states. It has no credential command/control, desktop IPC, provider HTTP, SQLite, privileged filesystem, system opener, or persistence. It displays `Demo mode`, resets on reload, and cannot prove desktop or security acceptance.
 
 ## 5. Typed IPC boundary
 
-The exact names may follow the implementation's naming convention, but the v1 command surface is limited to these capabilities:
+Every application-defined call uses a raw UTF-8 JSON byte body and is available only to the main window. Rust enforces the 320-KiB ceiling before JSON parsing, then exact keys/types/enums/lengths/state. Stable safe errors contain only code, bounded message, and retryability.
 
-| Capability                        | Input                                                            | Output                             | Security invariant                                                                                 |
-| --------------------------------- | ---------------------------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
-| List/get conversations            | Pagination/ID                                                    | Sanitized records                  | Bounded page size; opaque valid ID                                                                 |
-| Create/rename/delete conversation | Validated title/ID/confirmation token if used                    | Updated selection/result           | Parameterized SQL; delete atomic                                                                   |
-| Send/regenerate/edit-and-send     | Conversation/message ID, text, reasoning mode, client request ID | Accepted request envelope          | Length limits; no caller-supplied URL/model/header                                                 |
-| Cancel generation                 | Request ID                                                       | Cancellation state                 | Request belongs to current app session                                                             |
-| Credential prompt/delete/status   | No secret-bearing renderer input                                 | Success or boolean status          | Native prompt and Rust own capture; secret never enters webview/IPC/result/error                   |
-| Import/export                     | Export conversation ID, or no renderer input for import          | Cancellation-safe summary/result   | Rust opens the native dialog; no renderer-supplied path or serialized file payload; bounded schema |
-| Open external HTTPS link          | Bounded absolute URL                                             | Success or safe error              | Rust revalidates scheme/host/credentials/locality; OS browser only; no raw opener permission       |
-| Application status                | None                                                             | Safe version/provider/config state | No secret or sensitive path disclosure                                                             |
+| Operation                 | Renderer input                                                                                      | Safe result                                                            | Rust authority                                                                |
+| ------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Get catalog/status        | None                                                                                                | Catalog v2, default pair, safe provider credential/reachability states | Catalog is compiled; no endpoint/key returned                                 |
+| Create conversation       | Optional inherited catalog pair                                                                     | Conversation                                                           | Rust uses current pair or default `zai`/`glm-5.1`; pair validated             |
+| Change empty selection    | Conversation ID, provider ID, model ID                                                              | Updated conversation or locked error                                   | Rust checks catalog and zero-message invariant transactionally                |
+| Conversation CRUD         | Validated IDs/title/confirmation                                                                    | Conversation/selection result                                          | Parameterized SQL; delete atomic                                              |
+| Prompt/store credential   | Provider ID only                                                                                    | Configured/cancelled status                                            | Fixed native prompt/target selected from provider registry                    |
+| Remove/check credential   | Provider ID only                                                                                    | Configured status                                                      | No value crosses IPC; provider-scoped target                                  |
+| Send/edit/regenerate/stop | Conversation/message IDs, visible content, profile                                                  | Request ID/status/events                                               | Rust loads pinned pair, validates profile/state, owns networking/cancellation |
+| Get Usage                 | Provider ID and optional catalog model filter                                                       | Normalized seven-day counts, coverage, budget                          | Local SQLite only; no provider call                                           |
+| Set/clear budget          | Provider ID and bounded integer or explicit clear                                                   | Updated advisory budget                                                | Provider allowlist, checked integer, transaction                              |
+| Read/refresh balance      | None                                                                                                | DeepSeek bounded balance DTO/status                                    | DeepSeek-only commands; status is memory-only and refresh is explicit         |
+| Open provider account     | Provider ID and exact action enum value: `usage`, `billing`, `addCredits`, `spend`, or `deployment` | Success/safe error                                                     | Rust chooses fixed URL; caller supplies neither model ID nor URL              |
+| Import/export             | No path or serialized desktop file                                                                  | Count/cancel/status                                                    | Rust owns native file dialog and complete validation                          |
+| Open content link         | Bounded HTTPS URL from an explicit rendered-link click                                              | Success/safe error                                                     | Separate `ADR-0006` validation; never used for account actions                |
 
-The borderless Windows shell additionally grants only `core:window:allow-minimize`, `core:window:allow-toggle-maximize`, `core:window:allow-close`, and `core:window:allow-start-dragging` to the main window. These support the visible custom title bar and do not permit window creation or arbitrary window mutation.
+Provider ID, model ID, and action are untrusted enums at the IPC boundary even though React obtained them from the catalog. A compromised renderer cannot use them to select an unregistered combination.
 
-The webview adapter serializes every application-defined command argument object to UTF-8 JSON bytes and invokes Tauri with a `Uint8Array`; an argument-free application command sends raw `{}`. Rust rejects Tauri's pre-deserialized `InvokeBody::Json` form for these commands, checks the raw body against the 320-KiB ceiling before JSON parsing, validates nesting and the per-command key allowlist, deserializes into deny-unknown-field structures, and then performs semantic validation. This prevents typed application-command extraction or JSON-tree expansion from preceding the application boundary check. Tauri's four exact window actions and event listen/unlisten APIs remain framework-owned capabilities with no application data structure. Errors cross IPC only as a stable code, bounded safe user message, and retryable flag. Aster v1 does not create an application diagnostic log.
-
-The event surface is similarly narrow:
-
-```text
-GenerationStarted { requestId, conversationId, sequence: 0 }
-GenerationDelta   { requestId, conversationId, sequence, text }
-GenerationEnded   { requestId, conversationId, sequence, message?, status, safeUsage? }
-```
-
-The frontend accepts an event only when the request and conversation IDs match its active request and the sequence is the exact next value. The persisted assistant message identifier is returned only in the terminal `message` record. Duplicate, stale, cross-conversation, oversized, or out-of-order events are rejected or terminate the request safely according to the stream state machine.
-
-## 6. Conversation flow
+## 6. Conversation and provider flow
 
 ```mermaid
 sequenceDiagram
-    actor U as User
-    participant UI as React UI
-    participant C as Tauri/Rust core
-    participant V as Windows credential store
+    participant U as User
+    participant R as React
+    participant C as Rust conversation service
     participant D as SQLite
-    participant Z as Z.AI API
+    participant V as Windows credential store
+    participant P as Selected provider adapter
 
-    U->>UI: Submit prompt
-    UI->>C: send_message(validated input, client request ID)
-    C->>C: Validate state, size, mode, and notice state
-    C->>D: Transaction: persist complete user message and request settings
-    C->>V: Read provider key
-    V-->>C: Key inside Rust boundary
-    C->>Z: HTTPS POST /chat/completions, stream=true
-    C-->>UI: GenerationStarted
-    loop Bounded valid SSE deltas
-        Z-->>C: SSE event
-        C->>C: Parse, validate, sequence, and bound
-        C-->>UI: GenerationDelta
-    end
-    Z-->>C: End or error
-    C->>D: Transaction: insert one terminal assistant message
-    C-->>UI: GenerationEnded
+    U->>R: Create/select chat and model
+    R->>C: Create or update empty conversation
+    C->>D: Validate/persist provider + model + profile
+    U->>R: Send prompt
+    R->>C: Send(conversationId, content, profile)
+    C->>D: Load pinned pair and context
+    C->>C: Verify provider notice and profile capability
+    C->>V: Read only matching provider key
+    C->>P: Exact allowlisted HTTPS stream request
+    P-->>C: Bounded content, typed terminal outcome, and final usage metadata
+    C-->>R: Ordered request-bound events
+    C->>D: Terminalize message, finish reason, and usage once
 ```
 
-The provider request selects the application-owned endpoint and `glm-5.1`; callers cannot override an origin, authorization header, or arbitrary model. Relevant prior user/assistant messages are read in deterministic order. The API key is inserted only immediately before the HTTPS request.
+New chat inherits the pair only from a fully loaded conversation whose ID equals the current selection. If there is no selected conversation, Rust applies the catalog default `zai`/`glm-5.1`; New chat and Ctrl+N are disabled while a selected conversation is loading or its empty pair mutation is pending. React clears the prior loaded object when navigation begins, disables conversation-bound actions while loading or changing an empty conversation's pair, and applies asynchronous load/create/mutation results only when their operation authority and selected conversation ID still match. Navigation invalidates earlier authorities; a stale create may merge its backend-created summary but cannot change selection, conversation, or draft. Model selection from the no-conversation composer preserves that draft. Visible-load and background-reconciliation authorities are independent so a terminal event for one conversation cannot invalidate or wedge another conversation's load. An empty conversation may change pair. Once the first message is persisted, both columns are immutable. A backend update attempt returns `CONVERSATION_MODEL_LOCKED`; the UI may then request creation of a distinct empty conversation after explicit confirmation. There is no context migration or silent provider fallback. Before networking, Rust compares the stored per-provider notice version with the catalog disclosure version; a mismatch returns `PROVIDER_NOTICE_REQUIRED`, and only explicit acknowledgement of that exact provider/version enables the send.
 
-### 6.1 Cancellation
+### 6.1 Cancellation and explicit retry
 
-Cancellation is a backend state transition, not a cosmetic UI action:
+Stop resolves the request ID to a Rust-owned cancellation token, aborts the HTTP operation/body read, terminalizes once, and rejects stale/duplicate events. Hiding UI output is not cancellation.
 
-1. UI sends the active request ID once and immediately renders `Stopping…`.
-2. Rust resolves the request ID to an owned cancellation token.
-3. The token aborts the HTTP body read/request future.
-4. Rust commits accumulated partial content as `cancelled`, or an empty cancelled placeholder according to repository rules.
-5. Rust emits exactly one terminal event and removes the active request entry.
-6. Any late transport event is dropped and cannot change a terminal message.
+MVP v2 performs exactly one provider attempt per validated send. Authentication, rate-limit, transient connection, timeout, and provider failures terminalize with an actionable state and are never retried automatically, even before visible content, because an unseen request may already have consumed tokens. A later retry is a new explicit user action with a new operation identity and coverage observation.
 
-Closing a window or the application cancels in-flight work before shutdown. `streaming` and `stopping` exist only in runtime/UI state and are not persisted or importable. After an ungraceful exit, the already-committed user message remains and no complete assistant message is fabricated. A validated partial response may be persisted as `cancelled` or `error` only through the normal terminalization path.
+## 7. Provider and usage boundary
 
-### 6.2 Retry policy
+The catalog selects one of five concrete adapter families. Each applies the exact endpoint, authentication, request fields, response profiles, usage mapping, and finish semantics in [provider-contract.md](provider-contract.md). No general-purpose base URL exists in settings, IPC, import, or SQLite.
 
-The application never retries authentication or invalid-request errors. A transient connection failure or selected provider error may be retried only before response content has been surfaced, with a low fixed attempt limit, jittered exponential backoff, and provider `Retry-After` handling. Once content is visible, automatic replay is prohibited because it can duplicate cost or content; the user receives a retry/regenerate action.
+Stream parsers are bounded, pure where practical, and fuzzable. They tolerate legal split UTF-8/line boundaries, reject the first malformed or unsupported event, reject early/duplicate/out-of-order terminal or usage claims and unknown capability-bearing fields, discard hidden reasoning, and never execute tools. Raw provider errors do not cross IPC. A successful terminal maps to typed `stop` or `outputLimit`; the latter preserves validated partial visible content and usage and is never silently converted to a normal completion. Completed legacy/imported assistant messages without authoritative terminal evidence use `unknown`.
 
-## 7. Provider and stream boundary
+Usage normalization has four disjoint optional non-negative integer fields:
 
-The provider adapter **MUST** target the official Z.AI chat completions service over HTTPS. It applies:
+- `input_tokens`: non-cached input;
+- `cached_input_tokens`: cached input;
+- `output_tokens`: visible output plus provider-documented thought/reasoning tokens where applicable; and
+- `total_tokens`: the checked sum of the other three when the observation is complete.
 
-- exact HTTPS origin and documented path allowlisting;
-- normal hostname and certificate-chain validation;
-- connect, headers, idle/read, and overall request limits;
-- bounded request body, response headers, SSE line/event, delta, and total response sizes;
-- strict UTF-8/event parsing with graceful failure of malformed or incomplete streams;
-- authorization and error redaction before any diagnostic formatting;
-- support only for the verified `thinking.type` values `enabled` and `disabled`, with application-owned output caps of 4,096, 8,192, and 16,384 tokens for Fast, Standard, and Deep respectively;
-- no proxy controlled by IPC or model content.
+When a provider prompt count includes cached input, the adapter subtracts the validated cached count. Missing data remains null and makes coverage partial. Negative, fractional, inconsistent, or overflowing values are ignored as usage metadata without changing a completed answer. Immediately before the first network attempt for a validated send, Rust creates exactly one partial coverage observation bound to the operation. Authoritative final usage fills that row once. Cancellation, provider/connection failure, timeout, malformed/missing usage, or legal terminal without usage leaves it partial with nullable fields. Pre-network notice, profile, credential, input, state, or persistence failure creates no observation. Duplicate terminal frames cannot add or replace an observation, and MVP v2 has no automatic retry.
 
-The exact request/response fields verified for this MVP, the official-source links, and the boundary between provider facts and application policy are recorded in [provider-contract.md](provider-contract.md). Re-verifying documentation does not replace request snapshot, fake-server, or packaged network-policy tests.
+The Usage query aggregates observations whose UTC completion timestamp is in the trailing `now - 7 days` through `now` interval. It scopes the result to one provider and optionally one model. The budget is per provider and uses known `total_tokens` only. Rust classifies low state with the exact safe-integer comparison `remaining <= floor(budget / 10)`; the percentage is display-only. If the provider-wide known-total aggregate exceeds the JavaScript-safe range, the budget remains present with `knownUsedTokens = null`, zero remaining, exhausted state, and partial coverage. React explains that the exact total exceeds the supported display range rather than displaying a fabricated number. Partial coverage remains visible because the budget may undercount. No budget blocks or modifies a provider request.
 
-An SSE parser is a pure, fuzzable state machine. It must tolerate legal chunk boundaries, including split UTF-8 and split lines, without accepting unlimited buffering. Provider error bodies are untrusted and do not become raw HTML or an unbounded UI message.
+DeepSeek balance refresh is a separate explicit network action. It is not included in local aggregates and is held only in Rust memory for the session. Rust binds each refresh to a credential generation and monotonically latest operation. Under one balance-authority synchronization, a current completion commits its memory result and reachability; credential replace/delete instead invalidates every earlier operation, clears memory, and resets reachability. A stale completion can update neither field. Other providers expose no balance command path.
 
-### 7.1 Resource and timing baseline
+## 8. Resource and timing baseline
 
-These fixed MVP bounds implement `FR-005`, `FR-014`, `SEC-008`, `SEC-010`, `SEC-018`, and `SEC-024`. A limit change is a behavior and abuse-resistance change: update the owning requirement, threat review, acceptance fixture, and implementation together.
+These fixed bounds apply independently at their stated layers:
 
-| Boundary                      |                                                                                                                                                    MVP v1 limit |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------: |
-| API-key input                 | 8 through 255 printable ASCII bytes, with no whitespace; the 257-unit native buffer includes a reserved full-length/truncation sentinel and the terminating NUL |
-| Conversation title            |                                                                     1 through 80 Unicode scalar values after surrounding-whitespace trim; no control characters |
-| Composer usability limit      |                                                                                                                                        32,000 UTF-16 code units |
-| Raw IPC command body          |                                                                                                             320 KiB before JSON parsing or JSON-tree allocation |
-| Backend user-message input    |                                                                                                                                          256 KiB of UTF-8 bytes |
-| Stored assistant/user message |                                                                                                                                            2 MiB of UTF-8 bytes |
-| Provider history              |                                                                                                               200 messages and 512 KiB of visible UTF-8 content |
-| Serialized provider request   |                                                                                                                                                           1 MiB |
-| Provider response headers     |                                                                                                                                      64 fields and 32 KiB total |
-| SSE transport                 |                                                                                                                                                           8 MiB |
-| Buffered SSE line             |                                                                                                                                                          64 KiB |
-| SSE event                     |                                                                                                                                                         128 KiB |
-| Visible delta                 |                                                                                                                                                          64 KiB |
-| Accumulated visible response  |                                                                                                                                                           2 MiB |
-| Invalid/unsupported SSE event |                                                                                                                                  Fail closed on the first event |
-| Connect timeout               |                                                                                                                                                      10 seconds |
-| Idle/read timeout             |                                                                                                                                                      45 seconds |
-| Overall provider operation    |                                                                                                                                                      10 minutes |
-| Automatic attempts            |                                                                        At most two total, only before visible content and only for permitted transient outcomes |
-| Backoff delay                 |                                                                                   At most 5 seconds per retry, including validated provider guidance and jitter |
-| Provider context selection    |                                                                                   Most recent supported messages within both the 200-message and 512-KiB limits |
-| Native import file            |                                                                                                                  32 MiB, checked before and during bounded read |
-| Native export serialization   |                                                                                                                         32 MiB before the save dialog and write |
-| Imported collection           |                                                                                                   1 through 100 conversations and at most 10,000 messages total |
-| Imported JSON nesting         |                                                                              At most 8 open object/array container levels, checked before typed deserialization |
+| Boundary                                  |                                                                                                       MVP v2 limit |
+| ----------------------------------------- | -----------------------------------------------------------------------------------------------------------------: |
+| API-key input                             | 8–255 printable ASCII bytes without whitespace; full 256-character native result rejected as potentially truncated |
+| Provider/model/action ID                  |                                                                       Exact registered enum; no free-form fallback |
+| Token field or weekly budget crossing IPC |             Integer 0 through 9,007,199,254,740,991 (`Number.MAX_SAFE_INTEGER`); a configured budget is at least 1 |
+| Conversation title                        |                                                       1–80 Unicode scalar values after trim; no control characters |
+| Composer usability                        |                                                                                           32,000 UTF-16 code units |
+| Raw IPC command body                      |                                                                        320 KiB before JSON parsing/tree allocation |
+| Backend user message                      |                                                                                                      256 KiB UTF-8 |
+| Stored user/assistant message             |                                                                                                        2 MiB UTF-8 |
+| Provider history                          |                                                                             200 messages and 512 KiB visible UTF-8 |
+| Serialized provider request               |                                                                                                              1 MiB |
+| Provider response headers                 |                                                                                         64 fields and 32 KiB total |
+| SSE transport                             |                                                                                                              8 MiB |
+| Buffered SSE line                         |                                                                                                             64 KiB |
+| SSE event                                 |                                                                                                            128 KiB |
+| Visible delta                             |                                                                                                             64 KiB |
+| Ordered renderer events per response      |                                                                                                             65,536 |
+| Accumulated visible response              |                                                                                                              2 MiB |
+| Invalid/unsupported stream event          |                                                                                         Fail closed on first event |
+| Balance response body                     |                                                                             64 KiB and at most 16 currency entries |
+| Connect timeout                           |                                                                                                         10 seconds |
+| Idle/read timeout                         |                                                                                                         45 seconds |
+| Overall chat operation                    |                                                                                                         10 minutes |
+| Balance operation                         |                                                                             30 seconds overall; no automatic retry |
+| Automatic chat attempts                   |                                                                           Exactly one; automatic retry is disabled |
+| Retry/backoff                             |                                                                None; a retry is a distinct explicit user operation |
+| Native import                             |                                                                              32 MiB before and during bounded read |
+| Native export                             |                                                                                    32 MiB before save dialog/write |
+| Imported collection                       |                                                                    1–100 conversations and at most 10,000 messages |
+| Imported JSON nesting                     |                                                    At most 8 open object/array levels before typed deserialization |
 
-The UI's 32,000-unit composer limit is an early usability check. Rust independently enforces the larger 256-KiB trust-boundary ceiling so a compromised renderer cannot submit an unbounded message. Limits are measured at the layer stated and are not interchangeable with provider tokens.
+Provider-token budgets do not replace byte/character bounds. Rust may use a wider checked accumulator internally, but every individual field and aggregate crossing JSON IPC must fit `Number.MAX_SAFE_INTEGER`; otherwise the safe result is an overflow/partial state, not a rounded JavaScript number. All token addition/subtraction uses checked integer arithmetic.
 
-## 8. Persistence model
-
-SQLite is the source of truth for local conversation history. The minimum logical schema is:
+## 9. Persistence and migration
 
 ```mermaid
 erDiagram
@@ -253,8 +209,9 @@ erDiagram
     CONVERSATION {
         text id PK
         text title
-        text model
-        text reasoning_mode
+        text provider_id
+        text model_id
+        text response_profile
         text created_at
         text updated_at
     }
@@ -264,8 +221,28 @@ erDiagram
         text role
         text content
         text status
+        text finish_reason "nullable"
         text created_at
-        text safe_usage_json "nullable"
+        integer input_tokens "nullable"
+        integer cached_input_tokens "nullable"
+        integer output_tokens "nullable"
+        integer total_tokens "nullable"
+    }
+    USAGE_OBSERVATION {
+        text operation_id PK
+        text provider_id
+        text model_id
+        text observed_at
+        integer input_tokens "nullable"
+        integer cached_input_tokens "nullable"
+        integer output_tokens "nullable"
+        integer total_tokens "nullable"
+        integer partial
+    }
+    PROVIDER_PREFERENCE {
+        text provider_id PK
+        integer weekly_token_budget "nullable"
+        integer notice_version
     }
     SCHEMA_VERSION {
         integer version PK
@@ -274,49 +251,57 @@ erDiagram
     }
 ```
 
-Implementation rules:
+The v2 migration is transactional and idempotent. Before a table rebuild or destructive step, Rust uses SQLite's backup API to create a WAL-consistent snapshot at a deterministic sibling filename under the same current-user ACL; `fs::copy` or a live database-file copy is prohibited. Rust verifies the snapshot's SQLite integrity, exact v1 schema/version, and expected source identity before changing the original. After interruption it may reuse only that same verified v1 backup; an unverified or conflicting sibling blocks migration. It rebuilds the v1 conversation constraint, assigns `provider_id = "zai"` and `model_id = "glm-5.1"`, preserves the profile, maps legacy `token_usage` only to nullable message `total_tokens`, leaves the unavailable breakdown null, and assigns `finish_reason = "unknown"` only to completed legacy assistant messages because v1 contains no authoritative terminal evidence. It creates no usage observation from a v1 total because that value may have come from an import and is not proven locally incurred; rolling tracking begins only with authoritative v2 operations. After commit, Rust verifies v2 integrity/schema before deleting the verified backup. On failure the backup remains for recovery. A later successful startup may remove only a verified orphan matching the completed migration identity and never deletes an unknown sibling. Any corruption or verification failure is reported rather than replaced.
 
-- IDs are generated by the backend and treated as opaque.
-- Foreign keys are enabled; conversations delete messages atomically.
-- Content and title lengths are bounded before persistence.
-- Persisted user messages are `complete`; persisted assistant messages are terminal `complete`, `cancelled`, or `error`. Runtime `streaming` and `stopping` states are never database, import, or export enum values.
-- SQL is parameterized, including search-like operations if later introduced.
-- Schema migrations are ordered, checksummed when supported, transaction-safe, and tested both forward and from the prior supported schema.
-- The database never stores API credentials, authorization headers, provider raw traces, or hidden reasoning.
-- Database corruption produces a recoverable error path; the application does not silently replace or destroy a user's database.
-- File permissions are scoped to the current Windows user. This MVP does not claim application-level database encryption.
+Implementation rules remain: backend-generated opaque IDs, foreign keys enabled, parameterized SQL only, bounded fields, terminal stored statuses, constrained typed finish reasons, transaction-safe edits/deletes/finalization, current-user application-data permissions, no application diagnostics, and no credential/header/raw provider trace/hidden reasoning/balance in SQLite.
 
-## 9. Import and export
+Conversation message usage is valid only on a complete assistant row; schema
+constraints and Rust row mapping reject usage attached to a user, cancelled, or
+error row. Usage-observation operation IDs and timestamps use canonical UUID and
+UTC representations. Before lexical time filtering or aggregation, Rust
+validates every ledger row's identity, catalog pair, UTC time, token arithmetic,
+and partial-state invariant because SQLite content is untrusted.
 
-Export is a serialization of one selected conversation into a versioned application schema. Rust opens a native save dialog, writes only to the user-selected result, and returns cancellation-safe metadata rather than a filesystem path. The export contains only the fields needed to recreate the conversation and excludes secrets and internal identifiers. React never receives the serialized export merely to perform privileged filesystem I/O.
+Conversation deletion removes messages but does not retroactively erase a recent usage observation because provider consumption already occurred. Usage observations older than the product's trailing seven-day needs may be pruned transactionally. Clearing a provider budget does not clear observations or credentials.
 
-The exact v1 JSON shape is:
+## 10. Versioned import and export
+
+Rust-owned native dialogs select files. React supplies neither a path nor serialized desktop payload. Export writes version 2 only; import accepts exact version 1 and version 2 schemas.
+
+The v2 conversation shape is:
 
 ```json
 {
   "format": "aster-conversation",
-  "version": 1,
-  "exportedAt": "2026-07-12T12:00:00Z",
+  "version": 2,
+  "exportedAt": "2026-07-13T12:00:00Z",
   "conversations": [
     {
       "title": "Example",
+      "provider": "zai",
       "model": "glm-5.1",
-      "reasoningMode": "standard",
-      "createdAt": "2026-07-12T11:00:00Z",
-      "updatedAt": "2026-07-12T12:00:00Z",
+      "responseProfile": "standard",
+      "createdAt": "2026-07-13T11:00:00Z",
+      "updatedAt": "2026-07-13T12:00:00Z",
       "messages": [
         {
           "role": "user",
           "content": "Visible message text",
-          "createdAt": "2026-07-12T11:01:00Z",
+          "createdAt": "2026-07-13T11:01:00Z",
           "status": "complete"
         },
         {
           "role": "assistant",
           "content": "Visible response text",
-          "createdAt": "2026-07-12T11:02:00Z",
+          "createdAt": "2026-07-13T11:02:00Z",
           "status": "complete",
-          "tokenUsage": 42
+          "finishReason": "stop",
+          "usage": {
+            "inputTokens": 8,
+            "cachedInputTokens": 2,
+            "outputTokens": 32,
+            "totalTokens": 42
+          }
         }
       ]
     }
@@ -324,100 +309,35 @@ The exact v1 JSON shape is:
 }
 ```
 
-`tokenUsage` is omitted when unavailable. No other field is valid. In particular, source conversation/message IDs, `conversationId`, derived `messageCount`, credentials, configuration, paths, headers, requests, logs, and `reasoning_content` are prohibited. The desktop export command produces exactly one conversation; the importer accepts 1 through 100 for forward-compatible bundle handling.
+Each optional usage member is independently nullable/omittable, but a complete four-field object must satisfy the disjoint sum. Version 1 accepts only its historical `model: "glm-5.1"`, `reasoningMode`, and optional total `tokenUsage`, and maps it to `zai`, `glm-5.1`, the corresponding response profile, total-only usage, and `finishReason: "unknown"` for completed assistant messages. Version 2 requires a current catalog provider/model pair, a profile valid for that pair, and the exact finish-reason invariant: completed assistant messages carry `stop`, `outputLimit`, or `unknown`; user, cancelled, and error messages omit it. Import never changes an existing conversation's pinned pair or infers `stop` from absent evidence.
 
-Before a transaction, import enforces the section 7.1 file, nesting, count, title, and content limits; exact format/version; `model: "glm-5.1"`; the three reasoning modes; RFC 3339 timestamps with conversation `updatedAt >= createdAt`; and optional `tokenUsage` no greater than signed 64-bit SQLite range. Only `user` and `assistant` roles are accepted. User status is always `complete`; assistant status is `complete`, `cancelled`, or `error`. Complete content is non-whitespace. Cancelled/error assistant content may be empty. Content rejects NUL and every control character except CR, LF, and tab. Accepted timestamps are normalized to UTC for storage, and Rust generates every local ID.
+Both versions enforce the section 8 file/nesting/count/field bounds; exact keys and types; RFC 3339 timestamps normalized to UTC; `updatedAt >= createdAt`; allowed roles/statuses; complete non-whitespace content; control-character policy; checked usage integers and invariants; and full validation before one insert transaction. Unknown fields, unsupported versions/pairs/profiles, source/local IDs, `conversationId`, derived counts, credentials, budgets, aggregate usage, balance, configuration, paths, headers, raw requests, logs, and hidden reasoning are rejected. Rust generates all local IDs. A failure leaves the database unchanged.
 
-Import follows an explicit, atomic design:
+Export contains one selected conversation, warns that it is sensitive plaintext, stops before the native save dialog if serialization exceeds 32 MiB, and excludes provider preferences, aggregate usage observations, balances, credentials, and internal identifiers.
 
-1. Rust opens a native dialog that yields a user-selected file/handle; React supplies neither a path nor file content.
-2. Rust checks file size before full allocation.
-3. A strict versioned parser rejects unknown incompatible versions and invalid types, enums, counts, lengths, and timestamps.
-4. The entire logical document is validated without rendering or executing its content.
-5. Backend-generated IDs are assigned and one transaction inserts all data.
-6. Any error rolls back the transaction completely.
+## 11. Safe presentation, account navigation, and errors
 
-The native file selection is the explicit import action. MVP v1 does not add a second preview/confirmation step because import is additive, does not overwrite existing conversations, and remains reversible through the separately confirmed conversation-delete flow. After success, the UI reports the number imported. A future merge/overwrite import mode would require a new requirement, threat review, preview, and deliberate confirmation before implementation.
+Markdown is rendered as React elements with raw HTML disabled and a strict allowlist. Dangerous URL schemes, attributes, embedded content, and executable markup are rejected. Content links use the separate validated HTTPS navigation policy in `ADR-0006` and cannot navigate the webview or invoke provider-account actions.
 
-Imports never restore API keys, configuration, filesystem paths, request IDs, tool messages, HTML execution state, or provider headers. Exports warn that the JSON file contains plaintext conversation content.
+Provider account navigation accepts only a provider and one exact JSON action value: `usage`, `billing`, `addCredits`, `spend`, or `deployment`. Rust maps the pair to the exact official URL in the provider contract and opens the operating-system default browser. The React call contains neither model ID nor URL; user-facing labels are catalog metadata. Unsupported pairs, wrong-window calls, and encoded injection fail safely. Aster never observes the browser session or claims a purchase/plan change succeeded.
 
-## 10. Safe presentation
+A Usage result is `current` only when its latest local query or explicit balance refresh succeeded. If a later query fails, the UI may retain the previous timestamped result as `stale` while showing the new failure; it must not replace the error or imply a refresh succeeded. Provider network unreachability is `offline`, not stale by itself. A browser-demo stale state is explicitly synthetic.
 
-The frontend renders Markdown using a pinned allowlist parser/renderer that constructs React elements and never interprets model text as HTML. If an HTML sink is ever introduced, the approved allowlist sanitizer must run immediately before that sink. The renderer is configured to:
+User-visible errors identify the provider and one stable category: credential missing/rejected, profile incompatible, offline/TLS, rate limit, provider unavailable, timeout, content/context rejection, malformed response, database failure, balance unavailable/stale, or cancellation. They never interpolate raw provider bodies, SQL, paths, credentials, imported markup, balance payloads, or account URLs supplied by content.
 
-- disable or remove raw HTML;
-- allow only the elements and attributes required by `FR-009`;
-- remove event handlers, embedded content, forms, SVG/MathML unless explicitly and safely supported, inline style, and scriptable attributes;
-- allow only approved link protocols and open external links outside the webview with safe opener isolation;
-- render code as text even when a language name is hostile or unsupported;
-- avoid network-fetched syntax themes, scripts, images, or fonts.
+## 12. Verification seams and governing decisions
 
-Copy actions copy the underlying text, not executable HTML. Mermaid rendering is not an MVP requirement; if added later, it requires a separate threat-model update because diagram syntax and rendering expand the parser/rendering surface.
+Required seams include catalog snapshot/negative lookup tests; exact per-adapter request/stream/usage fixtures; fake credential targets and native-prompt classifiers; temporary SQLite migration/fault injection; fixed clocks for seven-day aggregation; fake DeepSeek balance server; account action-map tests; and browser-demo network/storage spies.
 
-## 11. Error and recovery model
+Governing decisions:
 
-Stable backend error families include:
-
-| Family                      | UI outcome                               | Retry behavior                |
-| --------------------------- | ---------------------------------------- | ----------------------------- |
-| Credential missing/rejected | Open settings or replace credential      | Never automatic               |
-| Rate limited                | Show wait guidance and safe retry time   | User action after limit       |
-| Provider unavailable        | Preserve prompt and partial state        | Bounded policy or user action |
-| Provider content rejected   | Explain the safe content-policy category | Never automatic               |
-| Provider context limit      | Advise starting a new conversation       | Never automatic               |
-| Offline/TLS/network         | Show connectivity guidance               | Bounded before first delta    |
-| Timeout                     | Mark response failed/interrupted         | User action                   |
-| Malformed/oversized stream  | Stop and show provider-response error    | Never automatic               |
-| Validation/import           | Explain rejected field/category safely   | After user correction         |
-| Storage                     | Preserve UI input; offer retry/recovery  | No destructive auto-reset     |
-| Cancelled                   | Keep clear cancelled state               | User may regenerate           |
-
-Error messages never interpolate raw provider bodies, SQL text, filesystem paths, authorization values, or imported/model-generated markup.
-
-## 12. Observability and privacy
-
-Aster v1 intentionally creates no application diagnostic log, crash-report upload, telemetry, or analytics. Safe error codes exist only in process and in bounded IPC responses; prompt text, response text, titles, imports, exports, API keys, headers, URLs, paths, and database rows are never formatted as diagnostics by the application. Operating-system records outside Aster's control are not represented as application logs or acceptance evidence.
-
-Adding local diagnostics or any upload is a separate product/privacy decision requiring a data inventory, retention and deletion policy, size bound, access policy, consent where applicable, threat-model update, ADR, and new acceptance criteria.
-
-## 13. Packaging and release boundary
-
-The application package **MUST** include only locally built frontend assets and the Tauri binary/resources required by the MVP. Runtime remote code is prohibited. Development builds are labelled and are not production artifacts.
-
-Source handoffs are a separate release boundary. A shared source archive is produced only from the tracked files of an identified clean Git commit. Ignored and untracked workspace content is excluded by construction; archiving the working directory with a hard-coded denylist is prohibited because future credentials, databases, exports, signing material, or generated artifacts may not appear in that list.
-
-A distributable production release requires:
-
-- reproducible or otherwise traceable build provenance;
-- dependency lockfiles and SBOM;
-- clean quality, vulnerability, secret, and policy gates;
-- least-privilege Tauri capabilities and verified CSP in the packaged artifact;
-- Windows code-signing evidence for the installer/binary;
-- signed update metadata and rollback verification before enabling automatic updates.
-
-If signing identity or evidence is unavailable, auto-update remains disabled and the output remains an engineering MVP build. This is an explicit gate state, not an implementation claim.
-
-## 14. Verification seams
-
-The architecture must remain testable without real secrets or paid calls:
-
-- provider adapter/test seam → controlled HTTP/SSE fixtures;
-- credential adapter/test seam → isolated fake target that prevents debug exposure;
-- repository test seam → temporary SQLite database;
-- clock/ID source → deterministic fixture;
-- dialog/file validation seam → scoped temporary file fixture;
-- event sink → ordered event recorder.
-
-Contract tests cover request mapping, every supported stream terminal path, cancellation races, malformed inputs, and bounds. Full traceability is maintained in [acceptance-criteria.md](acceptance-criteria.md).
-
-## 15. Related decisions
-
-- [ADR-0001: Keep credentials and provider networking behind the Rust boundary](decisions/0001-rust-trust-boundary.md)
-- [ADR-0002: Store conversations locally and credentials separately](decisions/0002-local-data-and-secrets.md)
-- [ADR-0003: Keep privileged tools and attachments outside MVP v1](decisions/0003-mvp-capability-boundary.md)
-- [ADR-0004: Isolate the browser demo from desktop capabilities and secrets](decisions/0004-browser-demo-isolation.md)
-- [ADR-0005: Pin the verified `glm-5.1` contract and use honest application response profiles](decisions/0005-provider-contract-and-response-profiles.md)
-- [ADR-0006: Open validated HTTPS links through a Rust-scoped system opener](decisions/0006-rust-scoped-external-links.md)
-- [ADR-0007: Use a narrow custom Windows title bar](decisions/0007-custom-windows-titlebar.md)
-- [ADR-0008: Capture provider credentials outside the webview](decisions/0008-native-credential-capture.md)
-- [ADR-0009: Persist no application diagnostics in MVP v1](decisions/0009-no-persistent-diagnostics.md)
+- [ADR-0001](decisions/0001-rust-trust-boundary.md): Rust trust boundary.
+- [ADR-0002](decisions/0002-local-data-and-secrets.md): local conversations and separate secrets.
+- [ADR-0004](decisions/0004-browser-demo-isolation.md): browser-demo isolation.
+- [ADR-0006](decisions/0006-rust-scoped-external-links.md): untrusted content links.
+- [ADR-0008](decisions/0008-native-credential-capture.md): native secret capture.
+- [ADR-0009](decisions/0009-no-persistent-diagnostics.md): no persistent diagnostics.
+- [ADR-0011](decisions/0011-curated-direct-provider-registry.md): curated direct multi-provider registry and profiles.
+- [ADR-0012](decisions/0012-provider-scoped-native-credentials.md): provider-scoped credentials.
+- [ADR-0013](decisions/0013-conversation-model-lock-and-usage-ledger.md): pinned conversations and local usage.
+- [ADR-0014](decisions/0014-read-only-balance-and-account-navigation.md): read-only balance and typed account navigation.
